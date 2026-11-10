@@ -1,0 +1,36 @@
+name: security
+
+on:
+  push:
+    branches: [main, "codex/**"]
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_call:
+  workflow_dispatch:
+  # Discover newly disclosed advisories even when the repository is idle.
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustsec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned audit tool
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --version '=0.22.2' --locked
+      - name: Audit locked dependencies against current RustSec advisories
+        # Do not use --no-fetch or ignore advisories. Fetch/network failures
+        # must fail the gate, not silently approve a release using stale data.
+        # --deny warnings also fails for yanked/unmaintained/unsound warnings.
+        run: cargo +stable audit --file Cargo.lock --deny warnings
