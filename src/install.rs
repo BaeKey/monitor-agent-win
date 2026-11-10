@@ -84,7 +84,12 @@ pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 pub(super) fn read_config(path: &Path) -> Result<HashMap<String, zeroize::Zeroizing<String>>> {
-    let bytes = secure_fs::read(path, MAX_CONFIG_BYTES as u64)?;
+    let bytes = secure_fs::read_secret(path, MAX_CONFIG_BYTES as u64)?;
+    parse_config_bytes(bytes.as_slice())
+}
+/// Upgrade compatibility only; runtime/service callers must use read_config.
+pub(super) fn read_config_for_install(path: &Path) -> Result<HashMap<String, zeroize::Zeroizing<String>>> {
+    let bytes = secure_fs::read_for_install(path, MAX_CONFIG_BYTES as u64)?;
     parse_config_bytes(bytes.as_slice())
 }
 
@@ -978,7 +983,7 @@ fn restore_config_record(manifest: &RecoveryManifest) -> Result<()> {
             bail!("invalid recovery backup path");
         }
         // Preserve the backup until ALL recovery operations succeed, making replay idempotent.
-        let stage = secure_fs::backup(&backup)?.context("recovery configuration backup is missing")?;
+        let stage = secure_fs::backup_secret(&backup)?.context("recovery configuration backup is missing")?;
         stage.commit(&path)?;
     } else {
         secure_fs::remove_private_file(&path)?;

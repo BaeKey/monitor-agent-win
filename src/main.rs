@@ -129,7 +129,11 @@ where
         .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_owned());
     validate_service_name(&service_name)?;
     let config_path = absolute_path(&config_path.unwrap_or_else(|| default_config_path(&service_name)))?;
-    let config = match read_config(&config_path) {
+    // Only the privileged installer may repair a legacy read-permissive config;
+    // service/foreground operation requires confidential credentials already.
+    let installing = std::env::args().nth(1).as_deref() == Some("install");
+    let loaded = if installing { read_config_for_install(&config_path) } else { read_config(&config_path) };
+    let config = match loaded {
         Ok(config) => config,
         Err(error) if !explicit_config && secure_fs::is_missing(&error) => HashMap::new(),
         Err(error) => return Err(error),

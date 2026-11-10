@@ -286,14 +286,15 @@ impl LogStorage for ProtectedFiles {
         if from == 0 || to == 0 {
             self.active.take();
         }
-        let source = self.checked_path(from)?;
-        let target = self.checked_path(to)?;
-        // No replace: a destination unexpectedly appearing is a fail-closed
-        // error. On Windows std::fs::rename refuses an existing destination.
-        match std::fs::rename(source, target) {
+        let source = self.checked_path(from)?.to_owned();
+        let target = self.checked_path(to)?.to_owned();
+        // The secure-fs API explicitly forbids replacing an existing target.
+        // Keep the directory guard and independent writer lock held throughout.
+        match crate::secure_fs::rename_no_replace(&source, &target) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+            // Inspect the underlying Windows error before wrapping anyhow in io.
+            Err(error) if crate::secure_fs::is_missing(&error) => Ok(()),
+            Err(error) => Err(io::Error::other(error)),
         }
     }
 

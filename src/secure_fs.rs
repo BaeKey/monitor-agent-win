@@ -202,7 +202,7 @@ fn open(path: &Path, write: bool, create: bool, directory: bool, share_delete: b
         inherit: 0,
     };
     // READ_CONTROL | WRITE_DAC. Creation has its final protected DACL BEFORE data is written.
-    let access = 0x20000
+    let access = 0x20000 | 0x80 // READ_CONTROL | FILE_READ_ATTRIBUTES for handle type checks
         | if directory {
             if write {
                 0x40000
@@ -326,8 +326,11 @@ fn check_file_mutation_acl(f: &File) -> Result<()> {
 fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
     // Ancestors may permit creating children, but never deleting our pinned child
     // or taking over its directory. Only ancestor checks trust TrustedInstaller.
-    let mask =
-        if ancestor { 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 } else { FILE_MUTATION_MASK | 0x40 };
+    let mask = if ancestor {
+        0x10000000 | 0x40000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 | 0x100
+    } else {
+        FILE_MUTATION_MASK | 0x40
+    };
     check_mutation_acl(f, ancestor, mask)
 }
 fn check_mutation_acl(f: &File, ancestor: bool, mutation_mask: u32) -> Result<()> {
@@ -457,10 +460,28 @@ pub fn directory(path: &Path, create: bool) -> Result<DirectoryGuard> {
 pub fn is_missing(e: &anyhow::Error) -> bool {
     e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.raw_os_error(), Some(2 | 3)))
 }
+/// Default is confidential; use the explicitly named upgrade-only API for legacy repair.
 pub fn read(path: &Path, limit: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_secret(path, limit)
+}
+pub fn read_secret(path: &Path, limit: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_checked(path, limit, true)
+}
+/// Only installation may read an admin-owned legacy file with untrusted read ACEs.
+/// Mutation ACL checks remain mandatory; this never repairs then trusts old content.
+pub fn read_for_install(path: &Path, limit: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_checked(path, limit, false)
+}
+fn check_secret_acl(f: &File) -> Result<()> {
+    check_mutation_acl(f, false, FILE_MUTATION_MASK | 0x1 | 0x80000000)
+}
+fn read_checked(path: &Path, limit: u64, secret: bool) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     let _guard = directory(path.parent().context("missing config parent")?, false)?;
     let f = open(path, false, false, false, false)?;
     check_file_mutation_acl(&f)?;
+    if secret {
+        check_secret_acl(&f)?;
+    }
     let mut bytes = zeroize::Zeroizing::new(Vec::new());
     f.take(limit.checked_add(1).context("read limit overflow")?).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
@@ -475,7 +496,7 @@ fn inspect(path: &Path, write_dac: bool) -> Result<File> {
     let h = unsafe {
         CreateFileW(
             p.as_ptr(),
-            0x20000 | if write_dac { 0x40000 } else { 0 },
+            0x20000 | 0x80 | if write_dac { 0x40000 } else { 0 },
             1 | 2 | 4,
             ptr::null(),
             3,
@@ -583,7 +604,9 @@ pub fn open_log(path: &Path) -> Result<File> {
     // Use FILE_APPEND_DATA, not a seek followed by a write (which races other writers).
     drop(file);
     let p = wide(path.as_os_str())?;
-    let h = unsafe { CreateFileW(p.as_ptr(), 0x4 | 0x20000, 1, ptr::null(), 3, 0x00200000, ptr::null_mut()) };
+    let h = unsafe {
+        CreateFileW(p.as_ptr(), 0x4 | 0x20000 | 0x80, 1, ptr::null(), 3, 0x00200000, ptr::null_mut())
+    };
     if h as isize == -1 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -701,6 +724,40 @@ pub fn remove_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Same-directory, no-replace rename. Caller pins its protected parent directory
+/// across rotations. Missing source is returned unchanged for the caller to handle.
+pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
+    let from = absolute(from)?;
+    let to = absolute(to)?;
+    if !from.parent().zip(to.parent()).is_some_and(|(a, b)| os_eq(a.as_os_str(), b.as_os_str())) {
+        bail!("log rename must stay in the same protected directory");
+    }
+    let _guard = directory(from.parent().context("missing rename parent")?, false)?;
+    // Source must exist and be a trusted regular single-link file. Do not turn
+    // NotFound into success here: the log-storage adapter owns that policy.
+    drop(inspect(&from, false)?);
+    check_destination(&to)?;
+    if unsafe { MoveFileExW(wide(from.as_os_str())?.as_ptr(), wide(to.as_os_str())?.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+/// Verify confidentiality before snapshotting recovery secrets, unlike legacy repair.
+pub fn backup_secret(path: &Path) -> Result<Option<Stage>> {
+    let _guard = directory(path.parent().context("missing backup parent")?, false)?;
+    let source = match open(path, false, false, false, false) {
+        Ok(f) => f,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    check_file_mutation_acl(&source)?;
+    check_secret_acl(&source)?;
+    let stage = Stage::new(path.parent().context("missing backup parent")?)?;
+    stage.copy_from(&mut &source)?;
+    stage.file().sync_all()?;
+    Ok(Some(stage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,7 +782,7 @@ mod tests {
         let mut acl = ptr::null_mut();
         let (mut present, mut defaulted) = (0, 0);
         assert_ne!(unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted) }, 0);
-        let file = open(path, true, false, false, false).unwrap();
+        let file = open(path, true, false, path.is_dir(), false).unwrap();
         assert_eq!(
             unsafe {
                 SetSecurityInfo(
@@ -762,9 +819,23 @@ mod tests {
             assert!(check_file_mutation_acl(&file).is_err());
             protect(&file, false).unwrap();
         }
-        // Ordinary read ACE remains compatible with administrator repair/install.
+        // Read-only data grants are accepted only by the explicit upgrade path.
+        for mask in [0x1, 0x80000000] {
+            set_test_users_ace(&path, mask);
+            assert!(read_for_install(&path, 1024).is_ok());
+            assert!(read_secret(&path, 1024).is_err());
+            assert!(read(&path, 1024).is_err());
+            assert!(backup_secret(&path).is_err());
+            // Rejection does not silently harden the file.
+            let file = open(&path, true, false, false, false).unwrap();
+            assert!(check_secret_acl(&file).is_err());
+            protect(&file, false).unwrap();
+        }
         set_test_users_ace(&path, 0x80000000);
-        assert!(read(&path, 1024).is_ok());
+        assert!(read_for_install(&path, 1024).is_ok());
+        assert!(read_secret(&path, 1024).is_err());
+        assert!(read(&path, 1024).is_err());
+        assert!(backup_secret(&path).is_err());
         check_destination(&path).unwrap();
         harden(&path).unwrap();
         let file = open(&path, false, false, false, false).unwrap();
@@ -784,6 +855,28 @@ mod tests {
         assert_eq!(info.count, 2);
         drop(file);
         remove_private_file(&path).unwrap();
+        drop(guard);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires elevated Windows token and NTFS protected directory"]
+    fn ancestor_rejects_generic_write_and_write_attributes_but_allows_child_creation() {
+        let root =
+            program_data().unwrap().join(format!("monitor-agent-ancestor-acl-test-{}", std::process::id()));
+        let guard = ensure_private_dir(&root).unwrap();
+        for mask in [0x40000000, 0x100] {
+            set_test_users_ace(&root, mask);
+            let dir = open(&root, true, false, true, false).unwrap();
+            assert!(check_directory_acl(&dir, true).is_err());
+            protect(&dir, true).unwrap();
+        }
+        for mask in [0x2, 0x4] {
+            set_test_users_ace(&root, mask);
+            let dir = open(&root, true, false, true, false).unwrap();
+            assert!(check_directory_acl(&dir, true).is_ok());
+            protect(&dir, true).unwrap();
+        }
         drop(guard);
         std::fs::remove_dir(root).unwrap();
     }
@@ -857,8 +950,24 @@ mod tests {
         assert!(std::fs::rename(&log_path, root.join("moved.log")).is_err());
         check_destination(&log_path).unwrap();
         harden(&log_path).unwrap();
+        let rotated = root.join("test.log.1");
+        assert!(
+            rename_no_replace(&log_path, &rotated).is_err(),
+            "live no-delete-share writer must block rotation"
+        );
         drop(log);
+        rename_no_replace(&log_path, &rotated).unwrap();
+        assert!(!log_path.exists());
+        assert!(rotated.exists());
+        let new_log = open_log(&log_path).unwrap();
+        drop(new_log);
+        assert!(rename_no_replace(&log_path, &rotated).is_err(), "rotation must not replace destination");
+        assert!(log_path.exists());
+        assert!(rotated.exists());
         std::fs::remove_file(&log_path).unwrap();
+        let error = rename_no_replace(&log_path, &rotated).unwrap_err();
+        assert!(is_missing(&error));
+        std::fs::remove_file(&rotated).unwrap();
         std::fs::remove_file(&target).unwrap();
         std::fs::remove_file(root.join(".install.lock")).unwrap();
         drop(guard);
