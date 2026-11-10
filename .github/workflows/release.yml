@@ -77,6 +77,11 @@ jobs:
           mkdir dist
           cp target/x86_64-pc-windows-gnu/release/monitor-agent.exe dist/monitor-agent-x86_64-pc-windows-gnu.exe
           (cd dist && sha256sum monitor-agent-x86_64-pc-windows-gnu.exe > sha256sums.txt)
+          # Carry reviewed text through the immutable build artifact. The
+          # publishing job does not check out or execute repository code.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ -f "release-notes/$GITHUB_REF_NAME.md" ]; then
+            cp "release-notes/$GITHUB_REF_NAME.md" dist/release-notes.md
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         id: upload
         with:
@@ -84,6 +89,7 @@ jobs:
           path: |
             dist/monitor-agent-x86_64-pc-windows-gnu.exe
             dist/sha256sums.txt
+            dist/release-notes.md
           if-no-files-found: error
           retention-days: 7
 
@@ -130,8 +136,16 @@ jobs:
         working-directory: dist
         run: |
           sha256sum --check sha256sums.txt
+          notes=(--generate-notes)
+          if [ -f release-notes.md ]; then
+            notes=(--notes-file release-notes.md)
+          fi
+          title="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_NAME" = v1.2.3 ]; then
+            title="$GITHUB_REF_NAME — Windows 安全修订版"
+          fi
           gh release create "$GITHUB_REF_NAME" \
             monitor-agent-x86_64-pc-windows-gnu.exe sha256sums.txt \
-            --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+            --verify-tag --title "$title" "${notes[@]}" --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
