@@ -8,6 +8,12 @@ on:
     paths-ignore: ["**.md", "LICENSE"]
   # Release must execute these checks on its own commit, not rely on a prior PR.
   workflow_call:
+    inputs:
+      source_ref:
+        description: Exact source commit to check (release retries)
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -33,13 +39,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_ref || github.sha }}
       # Use the runner's rustup rather than an unpinned toolchain action.
-      - name: Install Rust and Windows GNU cross compiler
-        timeout-minutes: 10
+      - name: Use installed Rust toolchain
+        timeout-minutes: 2
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-gnu
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y gcc-mingw-w64-x86-64
+          set -euo pipefail
+          rustc +stable --version
+          cargo +stable --version
+      - name: Install Windows Rust standard library
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          timeout 180s rustup target add --toolchain stable x86_64-pc-windows-gnu
+          timeout 180s rustup component add --toolchain stable clippy rustfmt
+      - name: Ensure Windows GNU C compiler
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null; then
+            # Do not refresh every runner package or stall on unrelated apt
+            # repositories. The Ubuntu image already has package indexes.
+            sudo timeout 240s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install --no-install-recommends -y gcc-mingw-w64-x86-64
+          fi
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-ar --version
       - run: cargo +stable fmt --all --check
       - run: cargo +stable check --locked --target x86_64-pc-windows-gnu
       - name: Clippy with public diagnostic annotations
@@ -61,6 +85,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_ref || github.sha }}
       # MSVC and the Windows SDK are provided by windows-latest. This target
       # actually runs the Win32 tests; GNU remains the shipping target below.
       - name: Install Windows Rust toolchain
@@ -176,5 +201,7 @@ jobs:
   rustsec:
     name: RustSec dependency audit
     uses: ./.github/workflows/security.yml
+    with:
+      source_ref: ${{ inputs.source_ref || github.sha }}
     permissions:
       contents: read

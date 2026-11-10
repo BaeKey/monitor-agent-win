@@ -4,13 +4,19 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to publish using this workflow (empty = build only)
+        required: false
+        type: string
+        default: ''
 
 # No build script or ordinary action receives a publishing/signing token.
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -21,13 +27,36 @@ jobs:
     name: Verify release tag
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      source-sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      publish: ${{ steps.source.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+      - name: Resolve immutable release source
+        id: source
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; fi
+          if [ -n "$tag" ]; then
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::Invalid version tag'; exit 1; }
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Match tag to package version
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
         # Parse TOML rather than matching unrelated version fields with sed.
-        # Branch workflow_dispatch is a checked build only; it cannot publish.
+        # Manual publication must specify an existing immutable version tag.
         shell: python
         run: |
           import os
@@ -35,9 +64,9 @@ jobs:
           from pathlib import Path
 
           version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
-          if os.environ["GITHUB_REF_TYPE"] == "tag":
+          if os.environ.get("RELEASE_TAG"):
               expected = f"v{version}"
-              actual = os.environ["GITHUB_REF_NAME"]
+              actual = os.environ["RELEASE_TAG"]
               if actual != expected:
                   raise SystemExit(f"Tag {actual!r} does not match Cargo.toml {expected!r}")
           else:
@@ -47,6 +76,8 @@ jobs:
     name: Required release checks
     needs: version
     uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.version.outputs.source-sha }}
     permissions:
       contents: read
 
@@ -61,16 +92,34 @@ jobs:
       CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
       AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
       RUSTFLAGS: -C target-feature=+crt-static
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Install Rust and Windows GNU cross compiler
-        timeout-minutes: 10
+          ref: ${{ needs.version.outputs.source-sha }}
+      - name: Use installed Rust toolchain
+        timeout-minutes: 2
         run: |
-          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y gcc-mingw-w64-x86-64
+          set -euo pipefail
+          rustc +stable --version
+          cargo +stable --version
+      - name: Install Windows Rust standard library
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          timeout 180s rustup target add --toolchain stable x86_64-pc-windows-gnu
+      - name: Ensure Windows GNU C compiler
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null; then
+            # Do not refresh every runner package or stall on unrelated apt
+            # repositories. The Ubuntu image already has package indexes.
+            sudo timeout 240s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install --no-install-recommends -y gcc-mingw-w64-x86-64
+          fi
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-ar --version
       - run: cargo +stable build --release --locked --target x86_64-pc-windows-gnu
       - name: Stage static GNU executable and checksum
         run: |
@@ -79,8 +128,8 @@ jobs:
           (cd dist && sha256sum monitor-agent-x86_64-pc-windows-gnu.exe > sha256sums.txt)
           # Carry reviewed text through the immutable build artifact. The
           # publishing job does not check out or execute repository code.
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ -f "release-notes/$GITHUB_REF_NAME.md" ]; then
-            cp "release-notes/$GITHUB_REF_NAME.md" dist/release-notes.md
+          if [ -n "$RELEASE_TAG" ] && [ -f "release-notes/$RELEASE_TAG.md" ]; then
+            cp "release-notes/$RELEASE_TAG.md" dist/release-notes.md
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         id: upload
@@ -95,8 +144,8 @@ jobs:
 
   attest:
     name: Attest checked release artifact
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: needs.version.outputs.publish == 'true'
+    needs: [version, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # No checkout, compilation or execution of repository code in this job.
@@ -118,8 +167,8 @@ jobs:
           subject-path: dist/monitor-agent-x86_64-pc-windows-gnu.exe
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, attest]
+    if: needs.version.outputs.publish == 'true'
+    needs: [version, build, attest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -140,12 +189,13 @@ jobs:
           if [ -f release-notes.md ]; then
             notes=(--notes-file release-notes.md)
           fi
-          title="$GITHUB_REF_NAME"
-          if [ "$GITHUB_REF_NAME" = v1.2.3 ]; then
-            title="$GITHUB_REF_NAME — Windows 安全修订版"
+          title="$RELEASE_TAG"
+          if [ "$RELEASE_TAG" = v1.2.3 ]; then
+            title="$RELEASE_TAG — Windows 安全修订版"
           fi
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             monitor-agent-x86_64-pc-windows-gnu.exe sha256sums.txt \
             --verify-tag --title "$title" "${notes[@]}" --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
