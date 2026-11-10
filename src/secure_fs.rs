@@ -205,11 +205,11 @@ fn open(path: &Path, write: bool, create: bool, directory: bool, share_delete: b
     // READ_CONTROL | WRITE_DAC. Creation has its final protected DACL BEFORE data is written.
     let access = 0x20000 | 0x80 // READ_CONTROL | FILE_READ_ATTRIBUTES for handle type checks
         | if directory {
-            if write {
-                0x40000
-            } else {
-                0
-            }
+            // FILE_LIST_DIRECTORY participates in data-access sharing checks.
+            // A metadata-only handle does NOT enforce our no-write/no-delete
+            // sharing policy against preexisting or subsequent data writers.
+            // Every ancestor and private leaf pin must request this access.
+            0x1 | if write { 0x40000 } else { 0 }
         } else if write {
             0x40000 | 0x40000000
         } else {
