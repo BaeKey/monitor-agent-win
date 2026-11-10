@@ -5,48 +5,132 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Read-only by default: the build jobs run third-party actions, dependency
-# build scripts and install hooks, none of which may hold a token that can
-# publish. Only the job that creates the release asks for more.
+# No build script or ordinary action receives a publishing/signing token.
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build:
+  version:
+    name: Verify release tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-      # A v* tag can be neither moved nor deleted, so one that disagrees with the
-      # version the agent reports stops here, before anything is published.
-      - if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
-          [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          targets: x86_64-pc-windows-gnu
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - run: RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked --target x86_64-pc-windows-gnu
-      - run: cp target/x86_64-pc-windows-gnu/release/monitor-agent.exe monitor-agent-x86_64-pc-windows-gnu.exe
-      - uses: actions/upload-artifact@v7
+          persist-credentials: false
+      - name: Match tag to package version
+        # Parse TOML rather than matching unrelated version fields with sed.
+        # Branch workflow_dispatch is a checked build only; it cannot publish.
+        shell: python
+        run: |
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              expected = f"v{version}"
+              actual = os.environ["GITHUB_REF_NAME"]
+              if actual != expected:
+                  raise SystemExit(f"Tag {actual!r} does not match Cargo.toml {expected!r}")
+          else:
+              print("Non-tag run: checks and build only; publishing is disabled.")
+
+  checks:
+    name: Required release checks
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [version, checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust and Windows GNU cross compiler
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+      - run: cargo +stable build --release --locked --target x86_64-pc-windows-gnu
+      - name: Stage static GNU executable and checksum
+        run: |
+          mkdir dist
+          cp target/x86_64-pc-windows-gnu/release/monitor-agent.exe dist/monitor-agent-x86_64-pc-windows-gnu.exe
+          (cd dist && sha256sum monitor-agent-x86_64-pc-windows-gnu.exe > sha256sums.txt)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
         with:
           name: x86_64-pc-windows-gnu
-          path: monitor-agent-x86_64-pc-windows-gnu.exe
+          path: |
+            dist/monitor-agent-x86_64-pc-windows-gnu.exe
+            dist/sha256sums.txt
+          if-no-files-found: error
+          retention-days: 7
 
-  release:
+  attest:
+    name: Attest checked release artifact
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout, compilation or execution of repository code in this job.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Check downloaded executable
+        working-directory: dist
+        run: sha256sum --check sha256sums.txt
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/monitor-agent-x86_64-pc-windows-gnu.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      # Select the immutable artifact ID from this build, not a wildcard/name
+      # search that could accidentally pick up an unrelated artifact.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
           merge-multiple: true
-      - if: startsWith(github.ref, 'refs/tags/')
+          path: dist
+      - name: Verify checksum and publish
+        working-directory: dist
         run: |
-          mkdir -p bin && mv monitor-agent-* bin/
-          (cd bin && sha256sum monitor-agent-* > sha256sums.txt)
-          gh release create "$GITHUB_REF_NAME" bin/monitor-agent-* bin/sha256sums.txt \
-            --generate-notes --repo "$GITHUB_REPOSITORY"
+          sha256sum --check sha256sums.txt
+          gh release create "$GITHUB_REF_NAME" \
+            monitor-agent-x86_64-pc-windows-gnu.exe sha256sums.txt \
+            --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

@@ -2,26 +2,92 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
     paths-ignore: ["**.md", "LICENSE"]
   pull_request:
     paths-ignore: ["**.md", "LICENSE"]
+  # Release must execute these checks on its own commit, not rely on a prior PR.
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Separate reusable release calls from ordinary CI runs for the same ref.
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
+    name: Format and Windows GNU lint
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          targets: x86_64-pc-windows-gnu
-          components: clippy, rustfmt
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - run: cargo fmt --all --check
-      - run: cargo check --locked --target x86_64-pc-windows-gnu
-      - run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+          persist-credentials: false
+      # Use the runner's rustup rather than an unpinned toolchain action.
+      - name: Install Rust and Windows GNU cross compiler
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-gnu
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+      - run: cargo +stable fmt --all --check
+      - run: cargo +stable check --locked --target x86_64-pc-windows-gnu
+      - run: cargo +stable clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+  windows-test:
+    name: Execute tests on Windows (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # MSVC and the Windows SDK are provided by windows-latest. This target
+      # actually runs the Win32 tests; GNU remains the shipping target below.
+      - name: Install Windows Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+      - name: Run all tests (not just compile them)
+        run: cargo +stable test --locked --target x86_64-pc-windows-msvc --all-targets
+      - name: Run elevated protected-filesystem regression
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          try {
+            $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+            if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'Protected-filesystem regression requires an elevated administrator token; refusing to skip. Use an elevated Windows runner.'
+            }
+          } finally {
+            $identity.Dispose()
+          }
+          # A filtered cargo test can succeed with zero matching tests. Verify
+          # the exact test exists before running it, so renames cannot bypass it.
+          $testName = 'secure_fs::tests::protected_filesystem_regression'
+          $listed = & cargo +stable test --locked --target x86_64-pc-windows-msvc $testName -- --list --ignored --exact
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to enumerate the protected-filesystem regression.'
+          }
+          if (-not ($listed -contains "${testName}: test")) {
+            throw 'Expected ignored protected-filesystem regression was not found; refusing to skip.'
+          }
+          & cargo +stable test --locked --target x86_64-pc-windows-msvc $testName -- --ignored --nocapture --exact
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Elevated protected-filesystem regression failed.'
+          }
+
+  rustsec:
+    name: RustSec dependency audit
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read

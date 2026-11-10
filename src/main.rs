@@ -1,15 +1,13 @@
 //! monitor-agent: reports one host to a monitor hub over WebSocket.
 
 mod collect;
+mod logging;
+mod secure_fs;
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{OsStr, OsString},
-    fs::{self, OpenOptions},
-    io::Write,
-    os::windows::ffi::OsStringExt,
-    path::{Path, PathBuf},
-    process::Command,
+    ffi::OsString,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -26,25 +24,22 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
-use collect::{Collector, Ifaces};
+use collect::{Ifaces, WorkerCollector};
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
-        ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo,
-        ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
-    service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
-#[derive(Clone)]
 struct Args {
     server: String,
-    token: String,
+    token: zeroize::Zeroizing<String>,
+    /// Locally authorized private/sensitive TCP probe destinations.
+    probe_allow: String,
     interval: u64,
     /// Adapter aliases selected by `--iface`; empty uses the default filter.
     ifaces: Ifaces,
@@ -80,6 +75,7 @@ Options:
   --token <token>      Node token from the hub panel
   --config <path>      Config file (default: per-service ProgramData path)
   --service-name <name> Service name (default: monitor-agent)
+  --probe-allow <list> Locally authorized probe destination CIDRs (default public only)
   --interval <secs>    Report interval (default 1)
   --iface <list>       Select adapter aliases; -name excludes from defaults
                        (e.g. Ethernet,-vEthernet (WSL))
@@ -102,6 +98,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, None, None, None);
+    let mut probe_allow = None;
     let mut config_path = None;
     let mut explicit_config = false;
     let mut service_name = None;
@@ -111,6 +108,7 @@ where
         match arg.as_str() {
             "--server" => server = Some(value()?),
             "--token" => token = Some(value()?),
+            "--probe-allow" => probe_allow = Some(value()?),
             "--config" => {
                 config_path = Some(PathBuf::from(value()?));
                 explicit_config = true;
@@ -138,7 +136,7 @@ where
     } else {
         HashMap::new()
     };
-    let config_value = |name: &str| config.get(name).map(String::as_str);
+    let config_value = |name: &str| config.get(name).map(|value| value.as_str());
 
     let server = server
         .or_else(|| config_value("MONITOR_SERVER").map(str::to_owned))
@@ -158,7 +156,12 @@ where
         .or_else(|| std::env::var("MONITOR_IFACE").ok().map(|value| (value, false)))
         .or_else(|| std::env::var("MONITOR_NICS").ok().map(|value| (value, true)));
     let ifaces = match iface_setting {
-        Some((value, true)) => Ifaces::from_legacy(parse_nics(&value)),
+        Some((value, true)) => {
+            if value.len() > 4096 || value.chars().any(char::is_control) {
+                bail!("legacy interface list is too long or contains control characters");
+            }
+            Ifaces::from_legacy(parse_nics(&value))
+        }
         Some((value, false)) => Ifaces::parse(&value).map_err(anyhow::Error::msg)?,
         None => Ifaces::default(),
     };
@@ -172,173 +175,34 @@ where
             },
         },
     };
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, service_name, insecure, config_path })
-}
-
-fn default_config_path(service_name: &str) -> PathBuf {
-    let root = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join(CONFIG_DIR_NAME);
-    if service_name == DEFAULT_SERVICE_NAME {
-        root.join(CONFIG_FILE_NAME)
-    } else {
-        root.join(format!("{service_name}.env"))
+    if server.len() > 4096 || token.len() > 4096 || ifaces.spec().len() > 4096 {
+        bail!("server, token and interface settings must not exceed 4096 bytes");
     }
-}
-
-fn validate_service_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 80
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        bail!("invalid service name: use 1-80 ASCII letters, digits, '-', '_' or '.'");
+    let probe_allow = probe_allow
+        .or_else(|| config_value("MONITOR_PROBE_ALLOW").map(str::to_owned))
+        .or_else(|| std::env::var("MONITOR_PROBE_ALLOW").ok())
+        .unwrap_or_default();
+    if probe_allow.len() > 4096 || probe_allow.chars().any(char::is_control) {
+        bail!("probe allowlist is too long or contains control characters");
     }
-    Ok(())
+    Ok(Args {
+        server,
+        token: zeroize::Zeroizing::new(token),
+        probe_allow,
+        interval: interval.clamp(1, 3600),
+        ifaces,
+        service_name,
+        insecure,
+        config_path,
+    })
 }
 
-fn parse_service_name<I>(args: I) -> Result<String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut name = None;
-    let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "service" => {}
-            "--service-name" => {
-                name = Some(it.next().ok_or_else(|| anyhow!("missing value for --service-name"))?);
-            }
-            "--config" => {
-                it.next().ok_or_else(|| anyhow!("missing value for --config"))?;
-            }
-            other => bail!("unknown service option: {other}"),
-        }
-    }
-    let name = name.unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_owned());
-    validate_service_name(&name)?;
-    Ok(name)
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_owned())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-fn read_config(path: &Path) -> Result<HashMap<String, String>> {
-    let mut values = HashMap::new();
-    for line in fs::read_to_string(path)?.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            bail!("invalid config line in {}", path.display());
-        };
-        values.insert(key.trim().to_owned(), value.trim().to_owned());
-    }
-    Ok(values)
-}
-
-fn parse_bool(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("invalid boolean value: {value}"),
-    }
-}
-
-fn validate_config_value(name: &str, value: &str) -> Result<()> {
-    if value.contains(['\r', '\n']) {
-        bail!("{name} contains a line break");
-    }
-    Ok(())
-}
-
-fn write_config(args: &Args) -> Result<()> {
-    validate_config_value("server", &args.server)?;
-    validate_config_value("token", &args.token)?;
-    validate_config_value("iface", args.ifaces.spec())?;
-    if let Some(parent) = args.config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = format!(
-        "MONITOR_SERVICE_NAME={}\nMONITOR_SERVER={}\nMONITOR_TOKEN={}\nMONITOR_INTERVAL={}\nMONITOR_IFACE={}\nMONITOR_INSECURE={}\n",
-        args.service_name,
-        args.server,
-        args.token,
-        args.interval,
-        args.ifaces.spec(),
-        if args.insecure { 1 } else { 0 },
-    );
-    fs::write(&args.config_path, content)?;
-    harden_config(&args.config_path)
-}
-
-fn system_icacls_path() -> Result<PathBuf> {
-    let mut buffer = vec![0u16; 260];
-    loop {
-        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        if length == 0 {
-            return Err(std::io::Error::last_os_error()).context("get Windows system directory");
-        }
-        let length = length as usize;
-        if length < buffer.len() {
-            buffer.truncate(length);
-            return Ok(PathBuf::from(OsString::from_wide(&buffer)).join("icacls.exe"));
-        }
-        buffer.resize(length + 1, 0);
-    }
-}
-
-fn harden_config(path: &Path) -> Result<()> {
-    let output = Command::new(system_icacls_path()?)
-        .arg(path)
-        .args(["/inheritancelevel:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"])
-        .output()
-        .context("run icacls")?;
-    if !output.status.success() {
-        bail!("icacls failed for {}: {}", path.display(), String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(())
-}
-
-fn current_service_name() -> String {
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        if arg == "--service-name" {
-            if let Some(name) = it.next() {
-                if validate_service_name(&name).is_ok() {
-                    return name;
-                }
-            }
-        }
-    }
-    DEFAULT_SERVICE_NAME.to_owned()
-}
-
-fn log_path() -> PathBuf {
-    let service_name = current_service_name();
-    let filename = if service_name == DEFAULT_SERVICE_NAME {
-        LOG_FILE_NAME.to_owned()
-    } else {
-        format!("{service_name}.log")
-    };
-    default_config_path(&service_name).with_file_name(filename)
-}
+#[path = "install.rs"]
+mod install;
+use install::*;
 
 fn log_line(line: &str) {
-    let path = log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-    }
-    eprintln!("{line}");
+    logging::log_line(line);
 }
 
 macro_rules! agent_log {
@@ -347,233 +211,12 @@ macro_rules! agent_log {
     }};
 }
 
-fn service_display_name(service_name: &str) -> String {
-    if service_name == DEFAULT_SERVICE_NAME {
-        SERVICE_DISPLAY_NAME.to_owned()
-    } else {
-        format!("{SERVICE_DISPLAY_NAME} ({service_name})")
-    }
-}
-
-fn installed_binary_path() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join(CONFIG_DIR_NAME)
-        .join("monitor-agent.exe")
-}
-
-fn prepare_binary_copy() -> Result<(PathBuf, Option<PathBuf>)> {
-    let source = std::env::current_exe()?;
-    let target = installed_binary_path();
-    if source.to_string_lossy().eq_ignore_ascii_case(&target.to_string_lossy()) {
-        return Ok((target, None));
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let pending = target.with_extension("exe.new");
-    if pending.exists() {
-        fs::remove_file(&pending)?;
-    }
-    fs::copy(&source, &pending)
-        .with_context(|| format!("copy current executable to {}", pending.display()))?;
-    Ok((target, Some(pending)))
-}
-
-fn commit_binary_copy(pending: Option<&Path>, target: &Path) -> Result<()> {
-    let Some(pending) = pending else { return Ok(()) };
-    fs::copy(pending, target).with_context(|| {
-        format!(
-            "copy installed executable to {}; another monitor-agent service may still be running",
-            target.display()
-        )
-    })?;
-    fs::remove_file(pending)?;
-    Ok(())
-}
-
-fn service_info(args: &Args, binary_path: &Path) -> Result<ServiceInfo> {
-    Ok(ServiceInfo {
-        name: OsString::from(&args.service_name),
-        display_name: OsString::from(service_display_name(&args.service_name)),
-        service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: binary_path.to_owned(),
-        launch_arguments: vec![
-            OsString::from("service"),
-            OsString::from("--config"),
-            args.config_path.as_os_str().to_owned(),
-            OsString::from("--service-name"),
-            OsString::from(&args.service_name),
-        ],
-        dependencies: Vec::new(),
-        account_name: None,
-        account_password: None,
-    })
-}
-
-fn open_service(service_name: &str, access: ServiceAccess) -> Result<windows_service::service::Service> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    Ok(manager.open_service(service_name, access)?)
-}
-
-fn configured_service_names() -> Result<Vec<String>> {
-    let installed_path = installed_binary_path();
-    let root = installed_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut names = HashSet::new();
-    let Ok(entries) = fs::read_dir(root) else { return Ok(Vec::new()) };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("env") {
-            continue;
-        }
-        let fallback = if path.file_name().and_then(|name| name.to_str()) == Some(CONFIG_FILE_NAME) {
-            DEFAULT_SERVICE_NAME.to_owned()
-        } else {
-            path.file_stem().and_then(|name| name.to_str()).unwrap_or_default().to_owned()
-        };
-        let name = read_config(&path)
-            .ok()
-            .and_then(|values| values.get("MONITOR_SERVICE_NAME").cloned())
-            .unwrap_or(fallback);
-        if validate_service_name(&name).is_ok() {
-            names.insert(name);
-        }
-    }
-    Ok(names.into_iter().collect())
-}
-
-fn stop_running_services() -> Result<Vec<String>> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP;
-    let mut stopped = Vec::new();
-    for name in configured_service_names()? {
-        let Ok(service) = manager.open_service(&name, access) else { continue };
-        if service.query_status()?.current_state != ServiceState::Stopped {
-            stop_and_wait(&service, &name)?;
-            stopped.push(name);
-        }
-    }
-    Ok(stopped)
-}
-
-fn restart_services(names: &[String]) -> Result<()> {
-    for name in names {
-        let service = open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
-        if service.query_status()?.current_state == ServiceState::Stopped {
-            service.start::<&OsStr>(&[])?;
-        }
-    }
-    Ok(())
-}
-
-fn stop_and_wait(service: &windows_service::service::Service, service_name: &str) -> Result<()> {
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        return Ok(());
-    }
-    let _ = service.stop()?;
-    for _ in 0..30 {
-        if service.query_status()?.current_state == ServiceState::Stopped {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    bail!("service {service_name} did not stop within 30 seconds")
-}
-
-fn install_service(args: Args) -> Result<()> {
-    write_config(&args)?;
-    let (binary_path, pending_binary) = prepare_binary_copy()?;
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )?;
-    let info = service_info(&args, &binary_path)?;
-    let access = ServiceAccess::QUERY_STATUS
-        | ServiceAccess::CHANGE_CONFIG
-        | ServiceAccess::START
-        | ServiceAccess::STOP
-        | ServiceAccess::DELETE;
-    let mut stopped_services = if pending_binary.is_some() { stop_running_services()? } else { Vec::new() };
-    let service = match manager.open_service(&args.service_name, access) {
-        Ok(service) => {
-            let was_running = service.query_status()?.current_state != ServiceState::Stopped;
-            stop_and_wait(&service, &args.service_name)?;
-            if was_running && !stopped_services.iter().any(|name| name == &args.service_name) {
-                stopped_services.push(args.service_name.clone());
-            }
-            commit_binary_copy(pending_binary.as_deref(), &binary_path)?;
-            service
-        }
-        Err(_) => {
-            commit_binary_copy(pending_binary.as_deref(), &binary_path)?;
-            manager.create_service(&info, access)?
-        }
-    };
-    service.change_config(&info)?;
-    service.set_description(SERVICE_DESCRIPTION)?;
-    service.set_delayed_auto_start(true)?;
-    service.update_failure_actions(ServiceFailureActions {
-        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(5) },
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(30) },
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(60) },
-            ServiceAction { action_type: ServiceActionType::None, delay: Duration::ZERO },
-        ]),
-    })?;
-    service.set_failure_actions_on_non_crash_failures(true)?;
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        service.start::<&OsStr>(&[])?;
-    }
-    restart_services(&stopped_services)?;
-    println!("installed and started {}", args.service_name);
-    println!("binary: {}", binary_path.display());
-    println!("config: {}", args.config_path.display());
-    Ok(())
-}
-
-fn stop_service(service_name: &str) -> Result<()> {
-    let service = open_service(service_name, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
-    stop_and_wait(&service, service_name)?;
-    println!("stopped {service_name}");
-    Ok(())
-}
-
-fn start_service(service_name: &str) -> Result<()> {
-    let service = open_service(service_name, ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        service.start::<&OsStr>(&[])?;
-    }
-    println!("started {service_name}");
-    Ok(())
-}
-
-fn uninstall_service(service_name: &str) -> Result<()> {
-    let service = open_service(
-        service_name,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    )?;
-    stop_and_wait(&service, service_name)?;
-    service.delete()?;
-    println!("removed {service_name}; config was kept");
-    Ok(())
-}
-
-fn status_service(service_name: &str) -> Result<()> {
-    let service = open_service(service_name, ServiceAccess::QUERY_STATUS)?;
-    println!("{service_name}: {:?}", service.query_status()?.current_state);
-    Ok(())
-}
-
 fn run_foreground(args: Args) -> Result<()> {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(run_agent(args, shutdown_rx))
+    let result = runtime.block_on(run_agent(args, shutdown_rx));
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 fn run_service(arguments: Vec<OsString>) -> Result<()> {
@@ -628,8 +271,14 @@ fn run_service(arguments: Vec<OsString>) -> Result<()> {
         wait_hint: Duration::ZERO,
         process_id: Some(std::process::id()),
     })?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let result = runtime.block_on(run_agent(args, shutdown_rx));
+    let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => {
+            let result = runtime.block_on(run_agent(args, shutdown_rx));
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            result
+        }
+        Err(error) => Err(error.into()),
+    };
     let exit_code = if result.is_ok() { ServiceExitCode::NO_ERROR } else { ServiceExitCode::Win32(1) };
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -799,13 +448,19 @@ fn main() -> Result<()> {
     result
 }
 
+#[path = "network.rs"]
+mod network;
+#[path = "probe.rs"]
+mod probe;
+#[path = "resolver.rs"]
+mod resolver;
+
 async fn run_agent(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let url = ws_url(&args.server, args.insecure)?;
-    let mut collector = Collector::new(args.ifaces.clone());
-    for iface in collector.missing_ifaces() {
-        agent_log!("interface {iface} is not listed by the operating system; it is counted as 0 bytes");
-    }
-    agent_log!("counting traffic on: {}", collector.counted_ifaces().join(", "));
+    let network = network::Network::shared()?;
+    let policy = std::sync::Arc::new(probe::Policy::parse(&args.probe_allow)?);
+    let loopback_only = !args.insecure && url.starts_with("ws://");
+    let mut collector = WorkerCollector::start(args.ifaces.clone())?;
     let mut wait = 0u64;
 
     loop {
@@ -813,8 +468,18 @@ async fn run_agent(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()
             return Ok(());
         }
         let mut connected = None;
-        let result =
-            session(&url, &args.token, &mut collector, args.interval, &mut connected, &mut shutdown).await;
+        let result = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            &mut connected,
+            &mut shutdown,
+            &network,
+            &policy,
+            loopback_only,
+        )
+        .await;
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -879,17 +544,24 @@ const HUB_SILENCE: Duration = Duration::from_secs(90);
 const FACTS_RECHECK: Duration = Duration::from_secs(60);
 
 /// One connection: handshake, then report until the socket closes.
+#[allow(clippy::too_many_arguments)]
 async fn session(
     url: &str,
     token: &str,
-    collector: &mut Collector,
+    collector: &mut WorkerCollector,
     interval: u64,
     connected: &mut Option<Instant>,
     shutdown: &mut watch::Receiver<bool>,
+    network: &std::sync::Arc<network::Network>,
+    policy: &std::sync::Arc<probe::Policy>,
+    loopback_only: bool,
 ) -> Result<()> {
     let request = authorized(url, token)?;
-    let config =
-        WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE))
+        .write_buffer_size(8 * 1024)
+        .max_write_buffer_size(128 * 1024);
     let uri = request.uri();
     let host = uri
         .host()
@@ -898,13 +570,14 @@ async fn session(
         .trim_end_matches(']')
         .to_owned();
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
-    let mut facts = collector.facts();
+    let mut facts = collector.facts().await?;
     let connect = async {
-        let stream = dial(&host, port, prefers_ipv4(&facts.ipv4)).await?;
-        let peer = stream.peer_addr()?;
+        let stream = dial(network, &host, port, prefers_ipv4(&facts.ipv4), loopback_only).await?;
+        let peer = stream.stream.peer_addr()?;
+        ensure_loopback_peer(peer, loopback_only)?;
         let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
             .await
-            .context("handshake")?;
+            .map_err(|_| anyhow!("hub handshake failed"))?;
         anyhow::Ok((ws, peer))
     };
     let connect_result = tokio::select! {
@@ -916,12 +589,19 @@ async fn session(
         .context("connect")?;
     agent_log!("connected to {peer}");
     *connected = Some(Instant::now());
-    let glimpse_from = |facts: &collect::Facts| {
-        if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
-            tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
-        }
-    };
-    glimpse_from(&facts);
+    let mut echoes = EchoTasks::default();
+    let echo_token = std::sync::Arc::new(zeroize::Zeroizing::new(token.to_owned()));
+    echoes
+        .update(
+            glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6),
+            url,
+            &echo_token,
+            &host,
+            port,
+            network,
+            loopback_only,
+        )
+        .await;
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
@@ -939,12 +619,12 @@ async fn session(
     result?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
-    let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut ping_tasks = PingTasks::default();
     // The baseline is taken a second before the first report, which then
     // measures CPU and network over that second rather than over nothing --
     // all a freshly started process has -- or over the outage since the
     // previous session.
-    collector.collect();
+    collector.begin_session_baseline().await?;
     let mut ticker =
         tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -955,19 +635,22 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
+                let sample = collector.collect().await?;
+                if !collector.has_sample() { continue; }
+                let m = serde_json::to_value(sample)?;
                 let Some(result) = send_or_stop(&mut ws, notify("report", m), remaining(last_frame), shutdown.clone()).await else {
                     break Ok(())
                 };
                 if let Err(error) = result { break Err(error); }
             }
             _ = recheck.tick() => {
-                let fresh = collector.facts();
+                let fresh = collector.facts().await?;
                 if fresh == facts {
                     continue;
                 }
                 if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
-                    glimpse_from(&fresh);
+                    echoes.update(glimpse_family(peer.is_ipv6(), &fresh.ipv4, &fresh.ipv6),
+                        url, &echo_token, &host, port, network, loopback_only).await;
                 }
                 let hello = notify("hello", serde_json::to_value(&fresh)?);
                 let Some(result) =
@@ -996,6 +679,11 @@ async fn session(
                 break Ok(())
             }
             incoming = ws.next() => {
+                if let Some(Ok(message)) = &incoming {
+                    if network.control(message.len()).is_err() {
+                        break Err(anyhow!("hub control message budget exceeded"));
+                    }
+                }
                 // Any frame proves the path alive, including the hub's
                 // heartbeat ping -- the only one on an otherwise idle link.
                 last_frame = Instant::now();
@@ -1004,7 +692,7 @@ async fn session(
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                    respawn_ping_tasks(&mut ping_tasks.0, tasks, &result_tx, network, policy);
                                 }
                             }
                         }
@@ -1019,18 +707,20 @@ async fn session(
         }
     };
 
-    for (_, handle) in ping_tasks {
-        handle.abort();
-    }
+    // RAII aborts probes and echo retries even when serialization or a write
+    // exits early. Socket permits remain held until cancellation really runs.
     result
 }
 
 /// The upgrade request for `url`, carrying the node's token.
 fn authorized(url: &str, token: &str) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
     let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    let bearer = zeroize::Zeroizing::new(format!("Bearer {token}"));
+    let mut value = bearer
+        .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+        .context("token is not header-safe")?;
+    value.set_sensitive(true);
+    request.headers_mut().insert("authorization", value);
     Ok(request)
 }
 
@@ -1078,16 +768,68 @@ fn echo_url(session: &str) -> Result<String> {
 /// interface holding only a private address cannot tell it. Nothing is
 /// exchanged. Failures are logged and otherwise ignored: the session does not
 /// depend on this one.
-async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) {
+#[derive(Default)]
+struct EchoTasks {
+    task: network::TaskGuard,
+}
+impl EchoTasks {
+    #[allow(clippy::too_many_arguments)]
+    async fn update(
+        &mut self,
+        family: Option<bool>,
+        url: &str,
+        token: &std::sync::Arc<zeroize::Zeroizing<String>>,
+        host: &str,
+        port: u16,
+        network: &std::sync::Arc<network::Network>,
+        loopback_only: bool,
+    ) {
+        // Called on initial hello and address changes only. Even in the same
+        // family an address change needs a fresh echo. Await actual cancellation
+        // before replacing it so old sockets/tokens cannot overlap a replacement.
+        for handle in self.task.0.drain(..) {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(v6) = family {
+            self.task.0.push(tokio::spawn(glimpse(
+                url.to_owned(),
+                token.clone(),
+                host.to_owned(),
+                port,
+                v6,
+                network.clone(),
+                loopback_only,
+            )));
+        }
+    }
+}
+
+async fn glimpse(
+    url: String,
+    token: std::sync::Arc<zeroize::Zeroizing<String>>,
+    host: String,
+    port: u16,
+    v6: bool,
+    network: std::sync::Arc<network::Network>,
+    loopback_only: bool,
+) {
     let family = if v6 { "IPv6" } else { "IPv4" };
     for attempt in 1..=GLIMPSE_TRIES {
-        match tokio::time::timeout(GLIMPSE_DEADLINE, echo_once(&url, &token, &host, port, v6)).await {
+        match tokio::time::timeout(
+            GLIMPSE_DEADLINE,
+            echo_once(&url, &token, &host, port, v6, &network, loopback_only),
+        )
+        .await
+        {
             Ok(Ok(Glimpse::Done)) => return,
             Ok(Ok(Glimpse::Refused(status))) => {
                 agent_log!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
                 return;
             }
-            Ok(Err(e)) => agent_log!("the hub could not be reached over {family}: {e:#}"),
+            // Do not log untrusted handshake response bodies/headers (which
+            // may reflect the Authorization token).
+            Ok(Err(_)) => agent_log!("the hub could not be reached over {family}: echo failed"),
             Err(_) => agent_log!("the hub could not be reached over {family}: no answer"),
         }
         if attempt < GLIMPSE_TRIES {
@@ -1096,24 +838,45 @@ async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) 
     }
 }
 
-async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> Result<Glimpse> {
-    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+async fn echo_once(
+    url: &str,
+    token: &str,
+    host: &str,
+    port: u16,
+    v6: bool,
+    network: &network::Network,
+    loopback_only: bool,
+) -> Result<Glimpse> {
+    let addrs: Vec<_> = network
+        .resolve(host, port)
         .await
-        .with_context(|| format!("resolve {host}"))?
-        .filter(|a| a.is_ipv6() == v6)
+        .context("resolve hub")?
+        .into_iter()
+        .filter(|a| a.is_ipv6() == v6 && (!loopback_only || probe::unmapped(a.ip()).is_loopback()))
         .collect();
     if addrs.is_empty() {
         return Ok(Glimpse::Done);
     }
-    let stream = connect_first(&addrs).await?;
+    let stream = connect_first(network, &addrs).await?;
+    ensure_loopback_peer(stream.stream.peer_addr()?, loopback_only)?;
     let request = authorized(&echo_url(url)?, token)?;
-    match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
+    let config =
+        WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+    match tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None).await {
         Ok(_) => Ok(Glimpse::Done),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            Ok(Glimpse::Refused(response.status().as_u16()))
-        }
-        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
+        Err(WsError::Http(response)) => Ok(Glimpse::Refused(response.status().as_u16())),
+        Err(_) => Err(anyhow!("echo handshake failed")),
     }
+}
+
+/// The URL spelling localhost is not proof of the peer's address. Check
+/// both resolved candidates (before a connection) and the actual socket peer
+/// (before sending credentials), including IPv4-mapped IPv6.
+fn ensure_loopback_peer(peer: std::net::SocketAddr, loopback_only: bool) -> Result<()> {
+    if loopback_only && !probe::unmapped(peer.ip()).is_loopback() {
+        bail!("plaintext hub without --insecure must have a loopback peer");
+    }
+    Ok(())
 }
 
 /// A private local IPv4 means the hub can learn the host's public NAT address
@@ -1128,33 +891,31 @@ fn sort_addresses(addrs: &mut [std::net::SocketAddr], prefer_v4: bool) {
     }
 }
 
-async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
-    let mut addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await.with_context(|| format!("resolve {host}"))?.collect();
+async fn dial(
+    network: &network::Network,
+    host: &str,
+    port: u16,
+    prefer_v4: bool,
+    loopback_only: bool,
+) -> Result<network::Connection> {
+    let mut addrs = network.resolve(host, port).await.context("resolve hub")?;
+    if loopback_only {
+        addrs.retain(|a| probe::unmapped(a.ip()).is_loopback());
+    }
     sort_addresses(&mut addrs, prefer_v4);
-    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+    connect_first(network, &addrs).await
 }
 
-async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
-    let mut failures = Vec::new();
-    for (index, addr) in addrs.iter().enumerate() {
-        let attempt = TcpStream::connect(addr);
-        let result = if index + 1 < addrs.len() {
-            tokio::time::timeout(DIAL_FALLBACK, attempt)
-                .await
-                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
-        } else {
-            attempt.await
-        };
-        match result {
-            Ok(stream) => return Ok(stream),
-            Err(error) => failures.push(format!("{addr}: {error}")),
+async fn connect_first(
+    network: &network::Network,
+    addrs: &[std::net::SocketAddr],
+) -> Result<network::Connection> {
+    for addr in addrs.iter().take(resolver::MAX_ADDRESSES) {
+        if let Ok(Ok(connection)) = tokio::time::timeout(DIAL_FALLBACK, network.connect(*addr, false)).await {
+            return Ok(connection);
         }
     }
-    if failures.is_empty() {
-        bail!("no address");
-    }
-    bail!("{}", failures.join("; "))
+    bail!("no reachable hub address");
 }
 
 /// Ceiling on concurrent probe loops.
@@ -1169,16 +930,35 @@ const MAX_PING_TASKS: usize = 64;
 
 /// Replaces the running probe loops with the hub's current task list, leaving
 /// unchanged tasks in place so their timers survive a push.
+#[derive(Default)]
+struct PingTasks(Vec<(PingTask, tokio::task::JoinHandle<()>)>);
+impl Drop for PingTasks {
+    fn drop(&mut self) {
+        for (_, handle) in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 fn respawn_ping_tasks(
     running: &mut Vec<(PingTask, tokio::task::JoinHandle<()>)>,
     mut wanted: Vec<PingTask>,
     tx: &mpsc::Sender<Message>,
+    network: &std::sync::Arc<network::Network>,
+    policy: &std::sync::Arc<probe::Policy>,
 ) {
-    if wanted.len() > MAX_PING_TASKS {
-        // Silent truncation would leave no record of which probes run.
-        agent_log!("hub asked for {} ping tasks, running {MAX_PING_TASKS}", wanted.len());
-        wanted.truncate(MAX_PING_TASKS);
-    }
+    // Canonical values are compared, not hub-controlled padding/raw intervals.
+    // First duplicate id wins, and invalid targets consume no task slots.
+    let mut ids = HashSet::new();
+    wanted = wanted
+        .into_iter()
+        .filter_map(|mut task| {
+            task.target = probe::normalize(&task.target).ok()?.2;
+            task.interval = task.interval.clamp(5, 3600);
+            ids.insert(task.id).then_some(task)
+        })
+        .take(MAX_PING_TASKS)
+        .collect();
     running.retain(|(task, handle)| {
         let keep =
             wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
@@ -1192,27 +972,17 @@ fn respawn_ping_tasks(
             continue;
         }
         let (tx, spawned) = (tx.clone(), task.clone());
+        let (network, policy) = (network.clone(), policy.clone());
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(spawned.interval.clamp(5, 3600)));
+            let period = Duration::from_secs(spawned.interval);
+            let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
             // As with the report ticker, missed ticks must not fire back to
             // back: the default burst behaviour would turn one stalled
             // resolution into a rapid series of connects.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Logged once per probe per session: a resolver that overruns does
-            // so every round, and the resulting gap would otherwise be
-            // unexplained.
-            let mut said = false;
             loop {
                 ticker.tick().await;
-                let Some(latency) = tcp_ping(&spawned.target).await else {
-                    if !std::mem::replace(&mut said, true) {
-                        agent_log!(
-                            "{}: name resolution runs past {}ms, so these rounds report no sample \
-                             rather than a loss",
-                            spawned.target,
-                            HANDSHAKE_DEADLINE.as_millis()
-                        );
-                    }
+                let Some(latency) = tcp_ping(&spawned.target, &network, &policy).await else {
                     continue;
                 };
                 let msg =
@@ -1257,42 +1027,41 @@ const MAX_PING_ADDRS: usize = 3;
 /// hostname resolves first and connects second, which would fold resolver
 /// latency into every sample. Resolution is repeated each round.
 ///
-/// ponytail: the `None` arm has no runtime reproduction; forcing it would
-/// require either a genuinely overrunning resolver or a test-only deadline
-/// parameter. The assertions below spell `Some(-1)`, so collapsing the two
-/// answers back into one `i32` fails to compile.
-async fn tcp_ping(target: &str) -> Option<i32> {
-    // Bounded by the handshake deadline: a resolution slower than a connect is
-    // useless as a latency sample, and `lookup_host` has no deadline of its own
-    // -- a blocked system resolver can take tens of seconds.
-    //
-    // This does not cancel the underlying `getaddrinfo`, which runs to
-    // completion on a blocking thread; it only keeps this probe on cadence.
-    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host(target)).await else {
+/// Policy rejection, resolver saturation and exhausted resource budgets also
+/// produce no sample, never fabricated packet loss.
+async fn tcp_ping(target: &str, network: &network::Network, policy: &probe::Policy) -> Option<i32> {
+    let Ok((host, port, normalized)) = probe::normalize(target) else { return Some(-1) };
+    if network.probe_round(&normalized).is_err() {
         return None;
+    }
+    let resolved = tokio::time::timeout(HANDSHAKE_DEADLINE, network.resolve(&host, port)).await;
+    let addresses = match resolved {
+        Err(_) => return None,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+        Ok(Err(_)) => return Some(-1),
+        Ok(Ok(addresses)) => addresses,
     };
-    // A resolution error is an unreachable target, which is what -1 reports.
-    // Only the deadline above is ambiguous.
-    let Ok(addresses) = resolved else { return Some(-1) };
-    Some(handshake(addresses).await)
+    // Validate every resolved candidate before connecting. Mixed public/private
+    // answers fail closed, preventing rebinding and mapped-v6 policy bypass.
+    if addresses.iter().any(|address| !policy.allows(*address)) {
+        return None;
+    }
+    handshake(addresses.into_iter(), network).await
 }
 
-/// Round-trip time of the first address that completes a handshake.
-///
-/// The clock restarts on each address, so a dead one contributes nothing;
-/// summing them would report the accumulated wait as latency.
-///
-/// Every failure advances to the next address, refusals included. The
-/// operating system may return the v6 address first; trying several
-/// addresses prevents an unusable v6 route from hiding a reachable v4 target.
-async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32 {
+async fn handshake(
+    addresses: impl Iterator<Item = std::net::SocketAddr>,
+    network: &network::Network,
+) -> Option<i32> {
     for address in addresses.take(MAX_PING_ADDRS) {
         let started = std::time::Instant::now();
-        if let Ok(Ok(_)) = tokio::time::timeout(HANDSHAKE_DEADLINE, TcpStream::connect(address)).await {
-            return started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        match tokio::time::timeout(HANDSHAKE_DEADLINE, network.connect(address, true)).await {
+            Ok(Ok(_connection)) => return Some(started.elapsed().as_millis().min(i32::MAX as u128) as i32),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+            _ => {}
         }
     }
-    -1
+    Some(-1)
 }
 
 #[cfg(test)]
@@ -1382,8 +1151,9 @@ mod tests {
         drop(dead_listener);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = listener.local_addr().unwrap();
-        let stream = connect_first(&[dead, live]).await.unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), live);
+        let network = network::Network::new().unwrap();
+        let connection = connect_first(&network, &[dead, live]).await.unwrap();
+        assert_eq!(connection.stream.peer_addr().unwrap(), live);
     }
 
     #[test]
@@ -1446,29 +1216,71 @@ mod tests {
     async fn tcp_ping_measures_success_and_reports_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-        // A loopback handshake completes within a millisecond, so this reads 0
-        // either way; what it pins is the contract that reachable is
-        // non-negative and unreachable is -1.
-        assert!(tcp_ping(&addr.to_string()).await.unwrap() >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, Some(-1), "nothing is listening there");
-        // A failed resolution is an unreachable target, not a missing sample.
-        // std rejects this port before the resolver is reached, so the
-        // assertion needs no network.
-        assert_eq!(tcp_ping("127.0.0.1:99999").await, Some(-1), "an unresolvable target is unreachable");
-
-        // First address dead: a dual-stack target on a host whose v6 goes
-        // nowhere. The probe advances rather than reporting it unreachable.
+        let policy = probe::Policy::parse("127.0.0.0/8").unwrap();
+        let network = network::Network::new().unwrap();
+        assert!(tcp_ping(&addr.to_string(), &network, &policy).await.unwrap() >= 0);
+        assert_eq!(tcp_ping("127.0.0.1:1", &network, &policy).await, Some(-1));
+        assert_eq!(tcp_ping("127.0.0.1:99999", &network, &policy).await, Some(-1));
         let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(handshake([dead, addr].into_iter()).await >= 0, "a dead address must not end the probe");
-        assert_eq!(handshake([dead, dead].into_iter()).await, -1, "every address failed");
-        // Past the ceiling the remainder are skipped; a long address list
-        // would otherwise hold a probe past its own interval.
-        assert_eq!(
-            handshake([dead, dead, dead, addr].into_iter()).await,
-            -1,
-            "a fourth address is not tried"
-        );
+        assert!(handshake([dead, addr].into_iter(), &network).await.unwrap() >= 0);
+        assert_eq!(handshake([dead, dead].into_iter(), &network).await, Some(-1));
+        assert_eq!(handshake([dead, dead, dead, addr].into_iter(), &network).await, Some(-1));
+    }
+
+    #[tokio::test]
+    async fn a_hub_probe_cannot_access_loopback_without_local_opt_in() {
+        let network = network::Network::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        assert_eq!(tcp_ping(&target, &network, &probe::Policy::default()).await, None);
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+    }
+
+    #[test]
+    fn plaintext_localhost_requires_an_actual_loopback_peer() {
+        assert!(ensure_loopback_peer("127.0.0.1:80".parse().unwrap(), true).is_ok());
+        assert!(ensure_loopback_peer("[::ffff:127.0.0.1]:80".parse().unwrap(), true).is_ok());
+        assert!(ensure_loopback_peer("10.0.0.1:80".parse().unwrap(), true).is_err());
+        assert!(ensure_loopback_peer("8.8.8.8:80".parse().unwrap(), true).is_err());
+        assert!(ensure_loopback_peer("10.0.0.1:80".parse().unwrap(), false).is_ok());
+        let request = authorized("wss://hub.example.com/api/agent/ws", "secret").unwrap();
+        assert!(request.headers()["authorization"].is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn echo_is_unique_per_family_and_owned_by_the_session() {
+        let network = network::Network::new().unwrap();
+        let token = std::sync::Arc::new(zeroize::Zeroizing::new("secret".to_owned()));
+        let mut echoes = EchoTasks::default();
+        echoes
+            .update(Some(true), "wss://example.com/api/agent/ws", &token, "example.com", 443, &network, false)
+            .await;
+        let old = echoes.task.0[0].abort_handle();
+        echoes
+            .update(Some(true), "wss://example.com/api/agent/ws", &token, "example.com", 443, &network, false)
+            .await;
+        assert!(old.is_finished(), "same-family address change cancels old echo first");
+        assert_eq!(echoes.task.0.len(), 1);
+        echoes
+            .update(None, "wss://example.com/api/agent/ws", &token, "example.com", 443, &network, false)
+            .await;
+        tokio::task::yield_now().await;
+        assert!(old.is_finished());
+        echoes
+            .update(
+                Some(false),
+                "wss://example.com/api/agent/ws",
+                &token,
+                "example.com",
+                443,
+                &network,
+                false,
+            )
+            .await;
+        let last = echoes.task.0[0].abort_handle();
+        drop(echoes);
+        tokio::task::yield_now().await;
+        assert!(last.is_finished());
     }
 
     /// The deadline must stay below a normal SYN retransmission window, or a
@@ -1557,6 +1369,29 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn task_churn_never_earns_an_immediate_probe() {
+        let network = network::Network::new().unwrap();
+        let policy = std::sync::Arc::new(probe::Policy::parse("127.0.0.0/8").unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut tasks = PingTasks::default();
+        for id in 0..100 {
+            respawn_ping_tasks(
+                &mut tasks.0,
+                vec![PingTask { id, target: target.clone(), interval: 5 }],
+                &tx,
+                &network,
+                &policy,
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(network.probe_round(&target).is_ok(), "no churned task performed even a DNS round");
+        assert_eq!(tasks.0.len(), 1);
+    }
+
     #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
         // The runtime flavour the binary uses.
@@ -1564,9 +1399,17 @@ mod tests {
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
         let mut running = Vec::new();
+        let network = network::Network::new().unwrap();
+        let policy = std::sync::Arc::new(probe::Policy::default());
         let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
 
-        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
+        respawn_ping_tasks(
+            &mut running,
+            vec![task(1, "a:1", 60), task(2, "b:2", 60)],
+            &tx,
+            &network,
+            &policy,
+        );
         assert_eq!(running.len(), 2);
         let (first, second) = (running[0].1.id(), running[1].1.id());
 
@@ -1575,6 +1418,8 @@ mod tests {
             &mut running,
             vec![task(1, "a:1", 60), task(2, "c:3", 60), task(3, "d:4", 60)],
             &tx,
+            &network,
+            &policy,
         );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
@@ -1584,14 +1429,18 @@ mod tests {
 
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.
-        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
+        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx, &network, &policy);
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");
+
+        let normalized = running[0].1.id();
+        respawn_ping_tasks(&mut running, vec![task(9, " E.:0005 ", 1)], &tx, &network, &policy);
+        assert_eq!(running[0].1.id(), normalized, "normalized interval and target retain timer");
 
         // One 64 KiB frame could carry some fifteen hundred of these; the
         // agent enforces its own ceiling rather than trusting the count.
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
-        respawn_ping_tasks(&mut running, flood, &tx);
+        respawn_ping_tasks(&mut running, flood, &tx, &network, &policy);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
     }
 }
