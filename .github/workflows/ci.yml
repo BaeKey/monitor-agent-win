@@ -96,9 +96,35 @@ jobs:
               throw "Expected ignored security regression was not found: $testName; refusing to skip."
             }
           }
-          & cargo +stable test --locked --target x86_64-pc-windows-msvc --all-targets -- --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Elevated filesystem or SCM recovery regression failed.'
+          # Handle native exit codes ourselves, including when runner defaults
+          # enable PSNativeCommandUseErrorActionPreference in PowerShell 7.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $captured = @()
+          $savedErrorActionPreference = $ErrorActionPreference
+          try {
+            # Older PowerShell 7 versions can turn redirected native stderr into
+            # ErrorRecords. Keep capturing it instead of terminating before Tee.
+            $ErrorActionPreference = 'Continue'
+            & cargo +stable test --locked --target x86_64-pc-windows-msvc --all-targets -- --ignored --nocapture 2>&1 | Tee-Object -Variable captured -ErrorAction Stop
+            $testExitCode = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+          }
+          if ($testExitCode -ne 0) {
+            $detail = ($captured | ForEach-Object { $_.ToString() }) -join "`n"
+            # Keep the tail containing panic/failure summaries. 16,000 UTF-16
+            # units expand to at most 48,000 after workflow-command escaping,
+            # leaving room for the heading below within the 50k character cap.
+            if ($detail.Length -gt 16000) {
+              $detail = '[earlier output truncated]' + "`n" + $detail.Substring($detail.Length - 16000)
+            }
+            if ([string]::IsNullOrWhiteSpace($detail)) {
+              $detail = 'Cargo produced no captured output.'
+            }
+            $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Elevated security regressions failed::Cargo exit code ${testExitCode}.%0A${detail}"
+            # Tee/annotation commands must not overwrite Cargo's failure status.
+            exit $testExitCode
           }
 
   rustsec:

@@ -660,7 +660,7 @@ fn enumerate_service_names() -> Result<Vec<String>> {
         for i in 0..count as usize {
             let entry = unsafe { &*buffer.as_ptr().cast::<Entry>().add(i) };
             let p = entry.name as usize;
-            if p < base || p >= end || p % 2 != 0 {
+            if p < base || p >= end || !p.is_multiple_of(2) {
                 bail!("SCM returned invalid service name pointer");
             }
             let max = ((end - p) / 2).min(257);
@@ -682,52 +682,6 @@ fn enumerate_service_names() -> Result<Vec<String>> {
         }
     }
     bail!("SCM enumeration iteration limit exceeded")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reject_reserved_names_and_collisions() {
-        for s in [
-            "agent", "AGENT", "Agent", "CON", "con.txt", "prn", "AUX", "NUL", "com1", "COM9.foo", "LPT1",
-            "lpt9.env", ".", "..", "ends.", "../bad",
-        ] {
-            assert!(validate_service_name(s).is_err(), "{s}");
-        }
-        for s in ["monitor-agent", "MONITOR-AGENT", "edge-01", "foo_bar", "COM10", "service.v2"] {
-            assert!(validate_service_name(s).is_ok(), "{s}");
-        }
-        assert_eq!(default_config_path("MONITOR-AGENT"), default_config_path("monitor-agent"));
-        assert_ne!(default_config_path("edge-01"), default_config_path("monitor-agent"));
-    }
-    #[test]
-    fn bounded_known_configuration_and_probe_policy() {
-        assert!(parse_config_bytes(&vec![b' '; MAX_CONFIG_BYTES + 1]).is_err());
-        assert!(parse_config_bytes(b"MONITOR_TOKEN=a\nMONITOR_TOKEN=b").is_err());
-        assert!(parse_config_bytes(b"NOT_A_KEY=secret").is_err());
-        assert!(parse_config_bytes(b"MONITOR_TOKEN=a\0b").is_err());
-        assert!(parse_config_bytes(&vec![b'\n'; 257]).is_err());
-        let v = parse_config_bytes(
-            b"MONITOR_TOKEN=secret\nMONITOR_PROBE_ALLOW=10.0.0.0/8:443\nMONITOR_NICS=Ethernet\n",
-        )
-        .unwrap();
-        assert_eq!(v["MONITOR_PROBE_ALLOW"].as_str(), "10.0.0.0/8:443");
-        assert_eq!(v["MONITOR_NICS"].as_str(), "Ethernet");
-        assert!(validate_config_value("probe_allow", "x\r\nMONITOR_TOKEN=evil").is_err());
-    }
-    #[test]
-    fn reject_redirected_and_non_normal_paths() {
-        for p in [
-            r"\\server\share\secret.env",
-            r"\\?\C:\secret.env",
-            r"C:\safe\..\bad",
-            r"C:\secret.env:stream",
-            r"C:\safe.\secret.env",
-        ] {
-            assert!(secure_fs::absolute(Path::new(p)).is_err(), "{p}");
-        }
-    }
 }
 
 fn validate_install_config_path(path: &Path, name: &str, root: &Path) -> Result<()> {
@@ -1250,12 +1204,17 @@ mod recovery_tests {
             manager
                 .create_service(
                     &info,
-                    ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG | ServiceAccess::DELETE,
+                    // Restart failure actions require SERVICE_START even though this
+                    // regression never starts the service itself.
+                    ServiceAccess::QUERY_CONFIG
+                        | ServiceAccess::CHANGE_CONFIG
+                        | ServiceAccess::START
+                        | ServiceAccess::DELETE,
                 )
                 .unwrap(),
         );
-        service.0.set_description("original description").unwrap();
-        service.0.set_delayed_auto_start(false).unwrap();
+        service.0.set_description("original description").expect("SCM fixture: set original description");
+        service.0.set_delayed_auto_start(false).expect("SCM fixture: clear delayed start");
         service
             .0
             .update_failure_actions(ServiceFailureActions {
@@ -1266,7 +1225,8 @@ mod recovery_tests {
             })
             .unwrap();
         service.0.set_failure_actions_on_non_crash_failures(false).unwrap();
-        let old = ScmSnapshot::capture(&service.0, &name).unwrap();
+        let old =
+            ScmSnapshot::capture(&service.0, &name).expect("SCM fixture: capture full original settings");
         let persisted = serde_json::to_vec(&old).unwrap();
         let old: ScmSnapshot = serde_json::from_slice(&persisted).unwrap();
         service.0.set_description("new description").unwrap();
@@ -1282,10 +1242,13 @@ mod recovery_tests {
                     delay: Duration::from_secs(3),
                 }]),
             })
-            .unwrap();
+            .expect("SCM regression: set Restart failure action with SERVICE_START access");
         service.0.set_failure_actions_on_non_crash_failures(true).unwrap();
-        old.restore(&service.0).unwrap();
-        assert_eq!(old, ScmSnapshot::capture(&service.0, &name).unwrap());
+        old.restore(&service.0).expect("SCM regression: restore all original settings");
+        assert_eq!(
+            old,
+            ScmSnapshot::capture(&service.0, &name).expect("SCM regression: recapture restored settings")
+        );
     }
 
     #[test]
@@ -1326,5 +1289,51 @@ mod recovery_tests {
         secure_fs::remove_private_file(&config).unwrap();
         drop(guard);
         std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reject_reserved_names_and_collisions() {
+        for s in [
+            "agent", "AGENT", "Agent", "CON", "con.txt", "prn", "AUX", "NUL", "com1", "COM9.foo", "LPT1",
+            "lpt9.env", ".", "..", "ends.", "../bad",
+        ] {
+            assert!(validate_service_name(s).is_err(), "{s}");
+        }
+        for s in ["monitor-agent", "MONITOR-AGENT", "edge-01", "foo_bar", "COM10", "service.v2"] {
+            assert!(validate_service_name(s).is_ok(), "{s}");
+        }
+        assert_eq!(default_config_path("MONITOR-AGENT"), default_config_path("monitor-agent"));
+        assert_ne!(default_config_path("edge-01"), default_config_path("monitor-agent"));
+    }
+    #[test]
+    fn bounded_known_configuration_and_probe_policy() {
+        assert!(parse_config_bytes(&vec![b' '; MAX_CONFIG_BYTES + 1]).is_err());
+        assert!(parse_config_bytes(b"MONITOR_TOKEN=a\nMONITOR_TOKEN=b").is_err());
+        assert!(parse_config_bytes(b"NOT_A_KEY=secret").is_err());
+        assert!(parse_config_bytes(b"MONITOR_TOKEN=a\0b").is_err());
+        assert!(parse_config_bytes(&vec![b'\n'; 257]).is_err());
+        let v = parse_config_bytes(
+            b"MONITOR_TOKEN=secret\nMONITOR_PROBE_ALLOW=10.0.0.0/8:443\nMONITOR_NICS=Ethernet\n",
+        )
+        .unwrap();
+        assert_eq!(v["MONITOR_PROBE_ALLOW"].as_str(), "10.0.0.0/8:443");
+        assert_eq!(v["MONITOR_NICS"].as_str(), "Ethernet");
+        assert!(validate_config_value("probe_allow", "x\r\nMONITOR_TOKEN=evil").is_err());
+    }
+    #[test]
+    fn reject_redirected_and_non_normal_paths() {
+        for p in [
+            r"\\server\share\secret.env",
+            r"\\?\C:\secret.env",
+            r"C:\safe\..\bad",
+            r"C:\secret.env:stream",
+            r"C:\safe.\secret.env",
+        ] {
+            assert!(secure_fs::absolute(Path::new(p)).is_err(), "{p}");
+        }
     }
 }

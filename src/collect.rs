@@ -843,8 +843,7 @@ impl Drop for RegistryKey {
 
 fn valid_registry_bytes(kind: u32, bytes: u32, capacity: usize) -> bool {
     kind == REG_SZ
-        && bytes >= 2
-        && bytes <= MAX_REGISTRY_BYTES
+        && (2..=MAX_REGISTRY_BYTES).contains(&bytes)
         && bytes.is_multiple_of(2)
         && bytes as usize <= capacity
 }

@@ -650,6 +650,57 @@ pub fn os_eq(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     a.encode_wide().map(lower).eq(b.encode_wide().map(lower))
 }
 
+fn is_device(name: &str) -> bool {
+    let n = name.split('.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(n.as_str(), "con" | "prn" | "aux" | "nul" | "conin$" | "conout$" | "clock$")
+        || ((n.starts_with("com") || n.starts_with("lpt"))
+            && n.len() == 4
+            && matches!(n.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// Bounded, fail-closed garbage collection. Caller serializes installation and
+/// first replays any recovery manifest, so referenced backups cannot be removed.
+pub fn cleanup_stages(parent: &Path) -> Result<()> {
+    let _guard = directory(parent, false)?;
+    let mut stages = 0;
+    for (index, entry) in std::fs::read_dir(parent)?.enumerate() {
+        if index >= 4096 {
+            bail!("stage cleanup directory entry limit exceeded");
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if name.len() != 39
+            || !name.starts_with(".stage-")
+            || !name[7..].bytes().all(|v| v.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        stages += 1;
+        if stages > 128 {
+            bail!("too many retained stage files; manual inspection required");
+        }
+        let f = inspect(&path, false)?;
+        let age = f.metadata()?.modified()?.elapsed().unwrap_or_default();
+        drop(f);
+        if age >= std::time::Duration::from_secs(24 * 3600) {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+/// Remove only a checked regular single-link file, with its directory pinned.
+pub fn remove_private_file(path: &Path) -> Result<()> {
+    let _guard = directory(path.parent().context("missing parent")?, false)?;
+    match inspect(path, false) {
+        Ok(f) => drop(f),
+        Err(e) if is_missing(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,55 +864,4 @@ mod tests {
         drop(guard);
         std::fs::remove_dir(&root).unwrap();
     }
-}
-
-fn is_device(name: &str) -> bool {
-    let n = name.split('.').next().unwrap_or_default().to_ascii_lowercase();
-    matches!(n.as_str(), "con" | "prn" | "aux" | "nul" | "conin$" | "conout$" | "clock$")
-        || ((n.starts_with("com") || n.starts_with("lpt"))
-            && n.len() == 4
-            && matches!(n.as_bytes()[3], b'1'..=b'9'))
-}
-
-/// Bounded, fail-closed garbage collection. Caller serializes installation and
-/// first replays any recovery manifest, so referenced backups cannot be removed.
-pub fn cleanup_stages(parent: &Path) -> Result<()> {
-    let _guard = directory(parent, false)?;
-    let mut stages = 0;
-    for (index, entry) in std::fs::read_dir(parent)?.enumerate() {
-        if index >= 4096 {
-            bail!("stage cleanup directory entry limit exceeded");
-        }
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        if name.len() != 39
-            || !name.starts_with(".stage-")
-            || !name[7..].bytes().all(|v| v.is_ascii_hexdigit())
-        {
-            continue;
-        }
-        stages += 1;
-        if stages > 128 {
-            bail!("too many retained stage files; manual inspection required");
-        }
-        let f = inspect(&path, false)?;
-        let age = f.metadata()?.modified()?.elapsed().unwrap_or_default();
-        drop(f);
-        if age >= std::time::Duration::from_secs(24 * 3600) {
-            std::fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-/// Remove only a checked regular single-link file, with its directory pinned.
-pub fn remove_private_file(path: &Path) -> Result<()> {
-    let _guard = directory(path.parent().context("missing parent")?, false)?;
-    match inspect(path, false) {
-        Ok(f) => drop(f),
-        Err(e) if is_missing(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    std::fs::remove_file(path)?;
-    Ok(())
 }

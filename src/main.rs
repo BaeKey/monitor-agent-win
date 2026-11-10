@@ -1305,8 +1305,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tx.send(true).unwrap();
         };
-        let wait =
-            wait_initial_facts(|| std::future::pending::<Result<Option<collect::Facts>>>(), &mut shutdown);
+        let wait = wait_initial_facts(std::future::pending::<Result<Option<collect::Facts>>>, &mut shutdown);
         let (result, ()) = tokio::join!(wait, stop);
         assert!(result.unwrap().is_none());
     }

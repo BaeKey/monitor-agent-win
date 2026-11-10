@@ -88,7 +88,7 @@ pub fn counters() -> Counters {
 }
 
 fn increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
 }
 
 /// Fixed one-second windows; at most 64 admitted records per window (up to 128
