@@ -1040,6 +1040,9 @@ fn recover_previous_install(root: &Path) -> Result<()> {
         let access = ServiceAccess::QUERY_STATUS
             | ServiceAccess::QUERY_CONFIG
             | ServiceAccess::STOP
+            // Restoring Restart failure-actions needs SERVICE_START even when
+            // the target is deliberately kept stopped until rollback completes.
+            | ServiceAccess::START
             | ServiceAccess::CHANGE_CONFIG
             | ServiceAccess::DELETE;
         let service = match manager.open_service(&manifest.target, access) {

@@ -96,6 +96,7 @@ unsafe extern "system" {
     fn GetAce(acl: Handle, index: u32, ace: *mut Handle) -> i32;
     fn EqualSid(a: Handle, b: Handle) -> i32;
     fn ConvertStringSidToSidW(s: *const u16, sid: *mut Handle) -> i32;
+    fn ConvertSidToStringSidW(sid: Handle, text: *mut *mut u16) -> i32;
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -324,13 +325,13 @@ fn check_file_mutation_acl(f: &File) -> Result<()> {
     check_mutation_acl(f, false, FILE_MUTATION_MASK)
 }
 fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
-    // Ancestors may permit creating children, but never deleting our pinned child
-    // or taking over its directory. Only ancestor checks trust TrustedInstaller.
-    let mask = if ancestor {
-        0x10000000 | 0x40000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 | 0x100
-    } else {
-        FILE_MUTATION_MASK | 0x40
-    };
+    // Normal Windows ancestors grant Users child creation and WRITE_ATTRIBUTES.
+    // These are not authority to delete an existing child or take over its ACL.
+    // Reparse mutation requires a data-write handle: directory() pins every
+    // component with share READ only, rejecting existing AND future such handles.
+    // Private leaf directories retain the complete mutation mask below.
+    let mask =
+        if ancestor { 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 } else { FILE_MUTATION_MASK | 0x40 };
     check_mutation_acl(f, ancestor, mask)
 }
 fn check_mutation_acl(f: &File, ancestor: bool, mutation_mask: u32) -> Result<()> {
@@ -381,7 +382,18 @@ fn check_mutation_acl(f: &File, ancestor: bool, mutation_mask: u32) -> Result<()
             trusted = unsafe { EqualSid(sid, installer) != 0 };
         }
         if !trusted && ace.mask & mutation_mask != 0 {
-            bail!("object grants untrusted mutation access");
+            let mut text = ptr::null_mut();
+            let sid_text = if unsafe { ConvertSidToStringSidW(sid, &mut text) } != 0 {
+                let _text = Local(text.cast());
+                let len =
+                    unsafe { (0..256).find(|&n| *text.add(n) == 0) }.context("oversized diagnostic SID")?;
+                OsString::from_wide(unsafe { std::slice::from_raw_parts(text, len) })
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "<unavailable>".to_owned()
+            };
+            bail!("object grants untrusted mutation access: SID={sid_text} ACE_mask=0x{:08x} forbidden=0x{:08x} ancestor={ancestor}",ace.mask,ace.mask & mutation_mask);
         }
     }
     Ok(())
@@ -429,7 +441,8 @@ pub fn directory(path: &Path, create: bool) -> Result<DirectoryGuard> {
                 if last {
                     check_owner(&f, false)?;
                 }
-                check_directory_acl(&f, !last)?;
+                check_directory_acl(&f, !last)
+                    .with_context(|| format!("unsafe directory ACL {}", prefix.display()))?;
                 if last && create {
                     protect(&f, true)?;
                 }
@@ -449,7 +462,8 @@ pub fn directory(path: &Path, create: bool) -> Result<DirectoryGuard> {
                     return Err(std::io::Error::last_os_error().into());
                 }
                 let f = open(&prefix, true, false, true, false)?;
-                check_directory_acl(&f, false)?;
+                check_directory_acl(&f, false)
+                    .with_context(|| format!("unsafe new directory ACL {}", prefix.display()))?;
                 protect(&f, true)?;
                 handles.push(f);
             }
@@ -861,23 +875,129 @@ mod tests {
 
     #[test]
     #[ignore = "requires elevated Windows token and NTFS protected directory"]
-    fn ancestor_rejects_generic_write_and_write_attributes_but_allows_child_creation() {
+    fn ancestor_allows_normal_windows_metadata_grants_but_rejects_takeover() {
         let root =
             program_data().unwrap().join(format!("monitor-agent-ancestor-acl-test-{}", std::process::id()));
         let guard = ensure_private_dir(&root).unwrap();
-        for mask in [0x40000000, 0x100] {
+        for mask in [0x10000000, 0x10000, 0x40000, 0x80000, 0x40] {
             set_test_users_ace(&root, mask);
             let dir = open(&root, true, false, true, false).unwrap();
             assert!(check_directory_acl(&dir, true).is_err());
             protect(&dir, true).unwrap();
         }
-        for mask in [0x2, 0x4] {
+        for mask in [0x2, 0x4, 0x100, 0x40000000] {
             set_test_users_ace(&root, mask);
             let dir = open(&root, true, false, true, false).unwrap();
             assert!(check_directory_acl(&dir, true).is_ok());
             protect(&dir, true).unwrap();
         }
         drop(guard);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    /// Exercise the actual NTFS FSCTL, not merely Rust symlink creation. A successful
+    /// unpinned control establishes that failures are access/share protection rather
+    /// than an invalid reparse buffer or an unavailable filesystem feature.
+    #[test]
+    #[ignore = "requires elevated Windows token and NTFS reparse-point support"]
+    fn pinned_directory_blocks_reparse_mutation_and_preexisting_writer() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn DeviceIoControl(
+                handle: Handle,
+                code: u32,
+                input: *const c_void,
+                input_len: u32,
+                output: Handle,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: Handle,
+            ) -> i32;
+        }
+        fn write_handle(path: &Path, access: u32) -> std::io::Result<File> {
+            let path = wide(path.as_os_str()).unwrap();
+            let h = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    access,
+                    1 | 2 | 4,
+                    ptr::null(),
+                    3,
+                    0x02000000 | 0x00200000,
+                    ptr::null_mut(),
+                )
+            };
+            if h as isize == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(unsafe { File::from_raw_handle(h) })
+        }
+        fn set_reparse(file: &File, buffer: &[u8]) -> std::io::Result<()> {
+            let mut returned = 0;
+            if unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    0x000900a4,
+                    buffer.as_ptr().cast(),
+                    buffer.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        let root =
+            program_data().unwrap().join(format!("monitor-agent-reparse-pin-test-{}", std::process::id()));
+        let root_guard = ensure_private_dir(&root).unwrap();
+        let ancestor = root.join("ancestor");
+        let target = root.join("target");
+        drop(ensure_private_dir(&ancestor).unwrap());
+        drop(ensure_private_dir(&target).unwrap());
+        let substitute: Vec<u16> = format!(r"\??\{}", target.display()).encode_utf16().collect();
+        let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+        let substitute_bytes = (substitute.len() * 2) as u16;
+        let print_bytes = (print.len() * 2) as u16;
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&0xa0000003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        buffer.extend_from_slice(&(8u16 + substitute_bytes + 2 + print_bytes + 2).to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        for value in [0, substitute_bytes, substitute_bytes + 2, print_bytes] {
+            buffer.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in substitute.iter().copied().chain([0]).chain(print.iter().copied()).chain([0]) {
+            buffer.extend_from_slice(&value.to_le_bytes());
+        }
+        // An already-open generic writer must prevent acquiring a trusted pin.
+        let writer = write_handle(&ancestor, 0x40000000).unwrap();
+        assert!(directory(&ancestor, false).is_err(), "pin accepted preexisting data writer");
+        drop(writer);
+        let pin = directory(&ancestor, false).unwrap();
+        let error = write_handle(&ancestor, 0x40000000).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32), "pinned directory must deny later generic writer");
+        // WRITE_ATTRIBUTES is compatible with normal ancestor ACLs but cannot
+        // authorize FSCTL_SET_REPARSE_POINT (requires data-write access).
+        let attributes = write_handle(&ancestor, 0x100 | 0x80).unwrap();
+        let error = set_reparse(&attributes, &buffer).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(5),
+            "metadata-only handle unexpectedly authorized reparse mutation"
+        );
+        drop(attributes);
+        drop(pin);
+        let writer = write_handle(&ancestor, 0x40000000).unwrap();
+        set_reparse(&writer, &buffer).expect("unpinned positive control must successfully set a junction");
+        drop(writer);
+        assert!(directory(&ancestor, false).is_err(), "junction was trusted as ordinary directory");
+        std::fs::remove_dir(&ancestor).unwrap(); // removes junction, never its target
+        assert!(target.is_dir());
+        std::fs::remove_dir(&target).unwrap();
+        drop(root_guard);
         std::fs::remove_dir(root).unwrap();
     }
 
