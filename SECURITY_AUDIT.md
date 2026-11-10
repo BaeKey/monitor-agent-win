@@ -270,4 +270,4 @@ CI 做 fmt/check/clippy，没有运行 Windows tests。Linux 上交叉 Clippy �
 - 安装中断恢复在下一次管理员执行 `install` 时进行；不宣称断电后无需人工动作即自动完成多文件/SCM事务。恢复失败保留记录并明确报错，不启动配置可能不匹配的目标实例。
 - 原生 NTFS 回归发现，metadata-only 句柄和目录共享限制不能阻止 `WRITE_ATTRIBUTES` 句柄设置重解析点；不得将句柄持有误当成“路径冻结”。当前改用逐组件 RootDirectory 相对打开以及按句柄重命名/删除，并保留攻击正向对照测试。
 - 路径保护以 SYSTEM、Administrators 和必要的系统祖先 TrustedInstaller 为信任边界，不试图防御同等高权限恶意操作。
-- 本地不安装交叉编译器；实际编译和 Windows 回归由 GitHub 执行。首轮 `ff54635` 已通过 GNU 类型检查、Windows tests、管理员文件系统回归及 RustSec；Clippy strict 发现的问题正在后续检查中收敛。最终通过状态以分支最新提交对应的 GitHub 结果为准。
+- 本地不安装交叉编译器；实际编译和 Windows 回归由 GitHub 执行。`8c720c5` 已通过 GNU fmt/check/Clippy（`-D warnings`）和静态 release 构建；`d940137` 已通过 84 项 Windows 测试（78 项普通测试 + 6 项管理员回归）、实际双实例服务安装/共存/升级/停止/启动/卸载，以及在线 RustSec。该轮最后的 GNU 任务停在工具链下载阶段，未进入代码检查；后续为稳定 CI 固定 Ubuntu 24.04 并增加下载超时。最终状态请查看分支最新 GitHub 检查。
