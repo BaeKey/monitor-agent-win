@@ -315,10 +315,25 @@ fn check_owner(f: &File, ancestor: bool) -> Result<()> {
     }
     bail!("untrusted file/directory owner")
 }
+// FILE_WRITE_DATA/APPEND_DATA/WRITE_EA/WRITE_ATTRIBUTES, DELETE,
+// WRITE_DAC/WRITE_OWNER and their generic expansions. Ordinary read is allowed:
+// installation may replace an old admin-owned file with an explicit Users-read ACE.
+const FILE_MUTATION_MASK: u32 =
+    0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000;
+fn check_file_mutation_acl(f: &File) -> Result<()> {
+    check_mutation_acl(f, false, FILE_MUTATION_MASK)
+}
 fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
+    // Ancestors may permit creating children, but never deleting our pinned child
+    // or taking over its directory. Only ancestor checks trust TrustedInstaller.
+    let mask =
+        if ancestor { 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 } else { FILE_MUTATION_MASK | 0x40 };
+    check_mutation_acl(f, ancestor, mask)
+}
+fn check_mutation_acl(f: &File, ancestor: bool, mutation_mask: u32) -> Result<()> {
     let (_sd, _, acl) = security(f)?;
     if acl.is_null() {
-        bail!("NULL directory DACL rejected");
+        bail!("NULL DACL rejected");
     }
     let (_trusted, admin, system) = trusted_sids()?;
     let mut info: AclInfo = unsafe { std::mem::zeroed() };
@@ -326,7 +341,7 @@ fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
         GetAclInformation(acl, ptr::addr_of_mut!(info).cast(), std::mem::size_of::<AclInfo>() as u32, 2)
     } == 0
     {
-        bail!("cannot inspect directory DACL");
+        bail!("cannot inspect object DACL");
     }
     for i in 0..info.count {
         let mut raw = ptr::null_mut();
@@ -347,7 +362,7 @@ fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
             continue;
         } // A denial is not an additional grant.
         if header.kind != 0 || (header.size as usize) < std::mem::size_of::<Ace>() + 4 {
-            bail!("unsupported or truncated directory ACE");
+            bail!("unsupported or truncated ACE");
         }
         let ace = unsafe { &*(raw as *const Ace) };
         let sid = ptr::addr_of!(ace.sid) as Handle;
@@ -362,14 +377,8 @@ fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
             let _owner = Local(installer);
             trusted = unsafe { EqualSid(sid, installer) != 0 };
         }
-        // ProgramData/drive ancestors may permit child creation, never child deletion or ACL takeover.
-        let mask = if ancestor {
-            0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x40
-        } else {
-            0x10000000 | 0x40000000 | 0x10000 | 0x40000 | 0x80000 | 0x2 | 0x4 | 0x10 | 0x40 | 0x100
-        };
-        if !trusted && ace.mask & mask != 0 {
-            bail!("directory grants untrusted mutation access");
+        if !trusted && ace.mask & mutation_mask != 0 {
+            bail!("object grants untrusted mutation access");
         }
     }
     Ok(())
@@ -451,7 +460,7 @@ pub fn is_missing(e: &anyhow::Error) -> bool {
 pub fn read(path: &Path, limit: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     let _guard = directory(path.parent().context("missing config parent")?, false)?;
     let f = open(path, false, false, false, false)?;
-    check_directory_acl(&f, false)?;
+    check_file_mutation_acl(&f)?;
     let mut bytes = zeroize::Zeroizing::new(Vec::new());
     f.take(limit.checked_add(1).context("read limit overflow")?).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
@@ -480,7 +489,7 @@ fn inspect(path: &Path, write_dac: bool) -> Result<File> {
     let f = unsafe { File::from_raw_handle(h) };
     check_type(&f, false)?;
     check_owner(&f, false)?;
-    check_directory_acl(&f, false)?;
+    check_file_mutation_acl(&f)?;
     Ok(f)
 }
 /// Exact protected DACL, never an additive grant. Caller pins parent for rotations.
@@ -500,6 +509,7 @@ pub fn check_destination(path: &Path) -> Result<()> {
 pub struct Stage {
     pub path: PathBuf,
     file: Option<File>,
+    cleanup: bool,
 }
 impl Stage {
     pub fn new(parent: &Path) -> Result<Self> {
@@ -510,7 +520,7 @@ impl Stage {
         let name = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let path = parent.join(format!(".stage-{name}"));
         let file = open(&path, true, true, false, false)?;
-        let stage = Self { path, file: Some(file) };
+        let stage = Self { path, file: Some(file), cleanup: true };
         protect(stage.file(), false)?;
         Ok(stage)
     }
@@ -525,6 +535,13 @@ impl Stage {
     pub fn copy_from(&self, source: &mut impl Read) -> Result<u64> {
         let mut file = self.file();
         Ok(std::io::copy(source, &mut file)?)
+    }
+    /// Close and retain a protected backup referenced by a durable recovery record.
+    pub fn persist(mut self) -> Result<PathBuf> {
+        self.file().sync_all()?;
+        drop(self.file.take());
+        self.cleanup = false;
+        Ok(self.path.clone())
     }
     pub fn commit(mut self, target: &Path) -> Result<()> {
         self.file().sync_all()?;
@@ -543,7 +560,9 @@ impl Stage {
 impl Drop for Stage {
     fn drop(&mut self) {
         drop(self.file.take());
-        let _ = std::fs::remove_file(&self.path);
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 pub fn ensure_private_dir(path: &Path) -> Result<DirectoryGuard> {
@@ -580,6 +599,8 @@ pub fn backup(path: &Path) -> Result<Option<Stage>> {
         Err(e) if is_missing(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
+    // Snapshotting must not bless attacker-editable old configuration either.
+    check_file_mutation_acl(&source)?;
     let stage = Stage::new(path.parent().context("missing backup parent")?)?;
     stage.copy_from(&mut &source)?;
     stage.file().sync_all()?;
@@ -633,6 +654,88 @@ pub fn os_eq(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn set_test_users_ace(path: &Path, mask: u32) {
+        let text = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{mask:08x};;;BU)");
+        let text = wide(std::ffi::OsStr::new(&text)).unwrap();
+        let mut raw = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    1,
+                    &mut raw,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let sd = Local(raw);
+        let mut acl = ptr::null_mut();
+        let (mut present, mut defaulted) = (0, 0);
+        assert_ne!(unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted) }, 0);
+        let file = open(path, true, false, false, false).unwrap();
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    1,
+                    0x80000004,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    acl,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires elevated Windows administrator token and real NTFS"]
+    fn reject_admin_owned_config_with_untrusted_mutation_ace_without_hardening() {
+        let root =
+            program_data().unwrap().join(format!("monitor-agent-file-acl-test-{}", std::process::id()));
+        let guard = ensure_private_dir(&root).unwrap();
+        let path = root.join("agent.env");
+        let stage = Stage::new(&root).unwrap();
+        stage.write_all(b"MONITOR_SERVER=https://attacker.invalid\n").unwrap();
+        stage.commit(&path).unwrap();
+        for mask in [0x2, 0x4, 0x10, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000] {
+            set_test_users_ace(&path, mask);
+            assert!(read(&path, 1024).is_err(), "allowed mutation mask {mask:x}");
+            assert!(check_destination(&path).is_err(), "allowed unsafe replacement target {mask:x}");
+            assert!(backup(&path).is_err(), "backed up untrusted configuration {mask:x}");
+            // Detection did not silently remove the bad ACE and trust the contents.
+            let file = open(&path, true, false, false, false).unwrap();
+            assert!(check_file_mutation_acl(&file).is_err());
+            protect(&file, false).unwrap();
+        }
+        // Ordinary read ACE remains compatible with administrator repair/install.
+        set_test_users_ace(&path, 0x80000000);
+        assert!(read(&path, 1024).is_ok());
+        check_destination(&path).unwrap();
+        harden(&path).unwrap();
+        let file = open(&path, false, false, false, false).unwrap();
+        let (_sd, _owner, acl) = security(&file).unwrap();
+        let mut info: AclInfo = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    acl,
+                    ptr::addr_of_mut!(info).cast(),
+                    std::mem::size_of::<AclInfo>() as u32,
+                    2,
+                )
+            },
+            0
+        );
+        assert_eq!(info.count, 2);
+        drop(file);
+        remove_private_file(&path).unwrap();
+        drop(guard);
+        std::fs::remove_dir(root).unwrap();
+    }
 
     /// Elevated Windows runner only: real DACL, links, sharing, replace and cleanup.
     /// Run: cargo test secure_fs::tests::protected_filesystem_regression -- --ignored
@@ -718,4 +821,47 @@ fn is_device(name: &str) -> bool {
         || ((n.starts_with("com") || n.starts_with("lpt"))
             && n.len() == 4
             && matches!(n.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// Bounded, fail-closed garbage collection. Caller serializes installation and
+/// first replays any recovery manifest, so referenced backups cannot be removed.
+pub fn cleanup_stages(parent: &Path) -> Result<()> {
+    let _guard = directory(parent, false)?;
+    let mut stages = 0;
+    for (index, entry) in std::fs::read_dir(parent)?.enumerate() {
+        if index >= 4096 {
+            bail!("stage cleanup directory entry limit exceeded");
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if name.len() != 39
+            || !name.starts_with(".stage-")
+            || !name[7..].bytes().all(|v| v.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        stages += 1;
+        if stages > 128 {
+            bail!("too many retained stage files; manual inspection required");
+        }
+        let f = inspect(&path, false)?;
+        let age = f.metadata()?.modified()?.elapsed().unwrap_or_default();
+        drop(f);
+        if age >= std::time::Duration::from_secs(24 * 3600) {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+/// Remove only a checked regular single-link file, with its directory pinned.
+pub fn remove_private_file(path: &Path) -> Result<()> {
+    let _guard = directory(path.parent().context("missing parent")?, false)?;
+    match inspect(path, false) {
+        Ok(f) => drop(f),
+        Err(e) if is_missing(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
 }

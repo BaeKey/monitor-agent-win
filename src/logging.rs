@@ -52,6 +52,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static TRUNCATED: AtomicU64 = AtomicU64::new(0);
 static STORAGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
+// The default binary uses the built-in secure-fs factory. Keep the explicit
+// injection API available for embedders without requiring a main.rs call site.
+#[allow(dead_code)] // Error type belongs to the optional init API below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlreadyInitialized;
 
@@ -59,6 +62,7 @@ pub struct AlreadyInitialized;
 /// Fails if initialization or the first log call has already claimed CONFIG.
 /// Deliberately accepts no raw PathBuf: callers cannot bypass protected opens.
 /// Normal Windows use needs no init: the built-in adapter uses secure_fs directly.
+#[allow(dead_code)] // Optional protected-storage injection; normal startup is lazy.
 pub fn init<F>(factory: F) -> Result<(), AlreadyInitialized>
 where
     F: FnOnce() -> io::Result<Box<dyn LogStorage>> + Send + 'static,
@@ -367,7 +371,7 @@ fn worker(rx: mpsc::Receiver<String>) {
             }
         }
     });
-    let mut reported = 0;
+    let mut reported = Counters { dropped: 0, truncated: 0, storage_errors: 0 };
     let mut last_report = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -377,12 +381,15 @@ fn worker(rx: mpsc::Receiver<String>) {
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();
-            let dropped = DROPPED.load(Ordering::Relaxed);
-            if dropped != reported && sink.is_some() {
-                // Only a bounded integer is formatted, once per second maximum.
-                let summary = format!("[logger] dropped {} records total\n", dropped);
+            let current = counters();
+            if current != reported && sink.is_some() {
+                // Only bounded integers are formatted, once per second maximum.
+                let summary = format!(
+                    "[logger] totals: dropped {}, truncated {}, storage_errors {}\n",
+                    current.dropped, current.truncated, current.storage_errors
+                );
                 write_record(&mut sink, summary.as_bytes());
-                reported = dropped;
+                reported = current;
             }
         }
     }

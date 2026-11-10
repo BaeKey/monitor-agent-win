@@ -129,12 +129,10 @@ where
         .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_owned());
     validate_service_name(&service_name)?;
     let config_path = absolute_path(&config_path.unwrap_or_else(|| default_config_path(&service_name)))?;
-    let config = if config_path.exists() {
-        read_config(&config_path)?
-    } else if explicit_config {
-        bail!("config file does not exist: {}", config_path.display())
-    } else {
-        HashMap::new()
+    let config = match read_config(&config_path) {
+        Ok(config) => config,
+        Err(error) if !explicit_config && secure_fs::is_missing(&error) => HashMap::new(),
+        Err(error) => return Err(error),
     };
     let config_value = |name: &str| config.get(name).map(|value| value.as_str());
 
@@ -142,10 +140,12 @@ where
         .or_else(|| config_value("MONITOR_SERVER").map(str::to_owned))
         .or_else(|| std::env::var("MONITOR_SERVER").ok())
         .ok_or_else(|| anyhow!("missing --server or MONITOR_SERVER"))?;
-    let token = token
-        .or_else(|| config_value("MONITOR_TOKEN").map(str::to_owned))
-        .or_else(|| std::env::var("MONITOR_TOKEN").ok())
-        .ok_or_else(|| anyhow!("missing --token or MONITOR_TOKEN"))?;
+    let token = zeroize::Zeroizing::new(
+        token
+            .or_else(|| config_value("MONITOR_TOKEN").map(str::to_owned))
+            .or_else(|| std::env::var("MONITOR_TOKEN").ok())
+            .ok_or_else(|| anyhow!("missing --token or MONITOR_TOKEN"))?,
+    );
     let interval = interval
         .or_else(|| config_value("MONITOR_INTERVAL").and_then(|v| v.parse().ok()))
         .or_else(|| std::env::var("MONITOR_INTERVAL").ok().and_then(|v| v.parse().ok()))
@@ -185,9 +185,13 @@ where
     if probe_allow.len() > 4096 || probe_allow.chars().any(char::is_control) {
         bail!("probe allowlist is too long or contains control characters");
     }
+    // Reject unusable settings before install mutates configuration or stops services.
+    let url = ws_url(&server, insecure)?;
+    authorized(&url, token.as_str())?;
+    probe::Policy::parse(&probe_allow)?;
     Ok(Args {
         server,
-        token: zeroize::Zeroizing::new(token),
+        token,
         probe_allow,
         interval: interval.clamp(1, 3600),
         ifaces,
@@ -543,6 +547,38 @@ const HUB_SILENCE: Duration = Duration::from_secs(90);
 /// How often a session recollects Facts and sends another hello when they change.
 const FACTS_RECHECK: Duration = Duration::from_secs(60);
 
+/// Initial host identity must be real before selecting an address family or
+/// sending hello. A stuck collector costs one short attempt, then reconnect
+/// backoff, rather than registering an empty/default host with the hub.
+const INITIAL_FACTS_DEADLINE: Duration = Duration::from_millis(250);
+
+async fn wait_initial_facts<F, Fut>(
+    mut poll: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<collect::Facts>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<collect::Facts>>>,
+{
+    if *shutdown.borrow() {
+        return Ok(None);
+    }
+    let ready = async {
+        loop {
+            if let Some(facts) = poll().await? {
+                return Ok(Some(facts));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => Ok(None),
+        result = tokio::time::timeout(INITIAL_FACTS_DEADLINE, ready) =>
+            result.map_err(|_| anyhow!("initial Facts unavailable within 250ms"))?,
+    }
+}
+
 /// One connection: handshake, then report until the socket closes.
 #[allow(clippy::too_many_arguments)]
 async fn session(
@@ -570,7 +606,23 @@ async fn session(
         .trim_end_matches(']')
         .to_owned();
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
-    let mut facts = collector.facts().await?;
+    // Polling only needs shared access; do not let the repeated async closure
+    // capture/reborrow the session's mutable reference across calls.
+    let collector: &WorkerCollector = collector;
+    let Some(mut facts) = wait_initial_facts(
+        || async {
+            // Read readiness BEFORE taking the snapshot: a background completion
+            // must not retroactively validate a default snapshot already returned.
+            let ready = collector.has_facts();
+            let facts = collector.facts().await?;
+            Ok(ready.then_some(facts))
+        },
+        shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let connect = async {
         let stream = dial(network, &host, port, prefers_ipv4(&facts.ipv4), loopback_only).await?;
         let peer = stream.stream.peer_addr()?;
@@ -632,7 +684,9 @@ async fn session(
     let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let result = loop {
+    // RAII aborts probes and echo retries on every exit, including `?`.
+    // The socket wrapper retains admission until its actual cancellation.
+    loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let sample = collector.collect().await?;
@@ -705,11 +759,7 @@ async fn session(
                 }
             }
         }
-    };
-
-    // RAII aborts probes and echo retries even when serialization or a write
-    // exits early. Socket permits remain held until cancellation really runs.
-    result
+    }
 }
 
 /// The upgrade request for `url`, carrying the node's token.
@@ -805,6 +855,7 @@ impl EchoTasks {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn glimpse(
     url: String,
     token: std::sync::Arc<zeroize::Zeroizing<String>>,
@@ -1210,6 +1261,54 @@ mod tests {
         // An explicit https:// hub stays on TLS: the flag permits plaintext
         // rather than forcing it.
         assert_eq!(ws_url("https://hub.example.com", true).unwrap(), "wss://hub.example.com/api/agent/ws");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_facts_timeout_never_promotes_a_default_snapshot() {
+        let (_tx, mut shutdown) = watch::channel(false);
+        let started = Instant::now();
+        let result = wait_initial_facts(|| async { Ok(None) }, &mut shutdown).await;
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), INITIAL_FACTS_DEADLINE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_facts_returns_only_a_valid_snapshot_and_honors_stop() {
+        let (tx, mut shutdown) = watch::channel(false);
+        let calls = std::cell::Cell::new(0);
+        let facts = wait_initial_facts(
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                async move {
+                    Ok((call != 0).then(|| collect::Facts { ipv4: "10.0.0.2".into(), ..Default::default() }))
+                }
+            },
+            &mut shutdown,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(facts.ipv4, "10.0.0.2");
+        assert!(prefers_ipv4(&facts.ipv4));
+        tx.send(true).unwrap();
+        assert!(wait_initial_facts(|| async { panic!("polled after Stop") }, &mut shutdown)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_initial_facts_is_interruptible_by_stop() {
+        let (tx, mut shutdown) = watch::channel(false);
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(true).unwrap();
+        };
+        let wait =
+            wait_initial_facts(|| std::future::pending::<Result<Option<collect::Facts>>>(), &mut shutdown);
+        let (result, ()) = tokio::join!(wait, stop);
+        assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]

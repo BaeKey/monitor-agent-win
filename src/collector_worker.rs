@@ -244,7 +244,9 @@ mod tests {
                 let request = requests.recv_timeout(THREAD_DEADLINE).unwrap();
                 started_tx.send(()).unwrap();
                 // Dropping release during a failed test also unblocks cleanup.
-                let _ = blocked.recv_timeout(THREAD_DEADLINE);
+                // Longer than the test-side deadline: a broken joining
+                // Drop must time out before this safety escape can release it.
+                let _ = blocked.recv_timeout(THREAD_DEADLINE * 3);
                 assert!(requests.try_recv().is_err(), "a timeout must not enqueue more work");
                 drop(request);
                 finished_tx.send(()).unwrap();

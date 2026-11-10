@@ -1091,6 +1091,65 @@ mod tests {
     }
 
     #[test]
+    fn bounded_adapter_parser_checks_both_union_lengths() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IP_ADAPTER_ADDRESSES_LH_0, IP_ADAPTER_ADDRESSES_LH_0_0, IP_ADAPTER_UNICAST_ADDRESS_LH_0,
+            IP_ADAPTER_UNICAST_ADDRESS_LH_0_0,
+        };
+        let mut buffer = AdapterBuffer::new(4096).unwrap();
+        let base = buffer.words.as_mut_ptr().cast::<u8>();
+        let adapter_pointer = base.cast::<IP_ADAPTER_ADDRESSES_LH>();
+        let unicast_pointer = base.wrapping_add(1024).cast::<IP_ADAPTER_UNICAST_ADDRESS_LH>();
+        let alias_pointer = base.wrapping_add(2048).cast::<u16>();
+        let socket_pointer = base.wrapping_add(3072).cast::<SOCKADDR_IN>();
+        let mut adapter = IP_ADAPTER_ADDRESSES_LH {
+            Anonymous1: IP_ADAPTER_ADDRESSES_LH_0 {
+                Anonymous: IP_ADAPTER_ADDRESSES_LH_0_0 {
+                    Length: size_of::<IP_ADAPTER_ADDRESSES_LH>() as u32,
+                    IfIndex: 1,
+                },
+            },
+            FirstUnicastAddress: unicast_pointer,
+            FriendlyName: alias_pointer,
+            OperStatus: IfOperStatusUp,
+            ..Default::default()
+        };
+        let mut unicast = IP_ADAPTER_UNICAST_ADDRESS_LH {
+            Anonymous: IP_ADAPTER_UNICAST_ADDRESS_LH_0 {
+                Anonymous: IP_ADAPTER_UNICAST_ADDRESS_LH_0_0 {
+                    Length: size_of::<IP_ADAPTER_UNICAST_ADDRESS_LH>() as u32,
+                    Flags: 0,
+                },
+            },
+            Address: SOCKET_ADDRESS {
+                lpSockaddr: socket_pointer.cast::<SOCKADDR>(),
+                iSockaddrLength: size_of::<SOCKADDR_IN>() as i32,
+            },
+            ..Default::default()
+        };
+        let mut socket = SOCKADDR_IN { sin_family: AF_INET, ..Default::default() };
+        socket.sin_addr.S_un.S_addr = u32::from_ne_bytes([8, 8, 4, 4]);
+        let alias = wide("Ethernet");
+        // SAFETY: all objects occupy distinct, aligned ranges of the 4 KiB
+        // allocation. Their pointers remain valid for the parser below.
+        unsafe {
+            adapter_pointer.write(adapter);
+            unicast_pointer.write(unicast);
+            socket_pointer.write(socket);
+            std::ptr::copy_nonoverlapping(alias.as_ptr(), alias_pointer, alias.len());
+        }
+        assert_eq!(addresses_from_buffer(&buffer), ("8.8.4.4".into(), String::new()));
+        unicast.Anonymous.Anonymous = IP_ADAPTER_UNICAST_ADDRESS_LH_0_0 { Length: 8, Flags: 0 };
+        // SAFETY: same live, aligned unicast output slot as above.
+        unsafe { unicast_pointer.write(unicast) };
+        assert_eq!(addresses_from_buffer(&buffer), (String::new(), String::new()));
+        adapter.Anonymous1.Anonymous = IP_ADAPTER_ADDRESSES_LH_0_0 { Length: 8, IfIndex: 1 };
+        // SAFETY: same live, aligned adapter output slot as above.
+        unsafe { adapter_pointer.write(adapter) };
+        assert_eq!(addresses_from_buffer(&buffer), (String::new(), String::new()));
+    }
+
+    #[test]
     fn busy_percent_uses_system_time_deltas() {
         assert_eq!(busy_percent((1000, 900), (1200, 950)), 75.0);
         assert_eq!(busy_percent((1000, 900), (1200, 1100)), 0.0);
