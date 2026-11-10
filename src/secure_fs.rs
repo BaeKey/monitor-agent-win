@@ -1127,41 +1127,51 @@ mod tests {
             .expect("positive control: metadata handle CAN create junction while guards live");
         assert!(directory(&ancestor, false).is_err(), "new walk must reject redirected ancestor");
         assert!(read_secret(&ancestor.join("guarded.env"), 1024).is_err());
-        // Create and commit through the parent handle captured before redirection.
-        // The junction is set on an empty directory, as required by NTFS.
-        let anchored_stage = Stage::in_directory(stage_parent).unwrap();
-        anchored_stage.write_all(b"anchored-before-redirect").unwrap();
-        // Existing parent handles must never follow newly attached reparse data.
-        anchored_stage.commit(&ancestor.join("guarded.env")).unwrap();
-        assert!(!target.join("guarded.env").exists(), "stage rename escaped to attacker directory");
-        let original = native_open(
-            pin.final_file().as_raw_handle(),
-            std::ffi::OsStr::new("guarded.env"),
-            0x80030080,
-            1 | 4,
-            1,
-            false,
-        )
-        .unwrap();
-        let mut bytes = Vec::new();
-        (&original).read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"anchored-before-redirect");
-        let new_stage = Stage::in_directory(directory(&root, false).unwrap()).unwrap();
-        new_stage.write_all(b"unrelated root stage").unwrap();
-        drop(new_stage);
-        let cleanup_stage = Stage::in_directory(DirectoryGuard {
-            handles: vec![pin.final_file().try_clone().unwrap()],
-            path: ancestor.clone(),
-        })
-        .unwrap();
-        let stage_name = cleanup_stage.path.file_name().unwrap().to_owned();
-        drop(cleanup_stage);
-        assert!(
-            native_open(pin.final_file().as_raw_handle(), &stage_name, 0x20080, 7, 1, false).is_err(),
-            "stage drop did not remove original-directory object"
+        // NTFS may reject even a relative open beneath an existing handle after
+        // that directory acquires reparse data. Both outcomes are safe: explicit
+        // reparse refusal, or successful access proven to remain in the old namespace.
+        // Never accept NotFound or an arbitrary error as evidence of protection.
+        let mut committed = false;
+        let attempt = (|| -> Result<()> {
+            let anchored_stage = Stage::in_directory(stage_parent)?;
+            anchored_stage.write_all(b"anchored-before-redirect")?;
+            anchored_stage.commit(&ancestor.join("guarded.env"))?;
+            committed = true;
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => {
+                let original = native_open(
+                    pin.final_file().as_raw_handle(),
+                    std::ffi::OsStr::new("guarded.env"),
+                    0x80030080,
+                    1 | 4,
+                    1,
+                    false,
+                )
+                .expect("successful relative commit must be readable in the original namespace");
+                let mut bytes = Vec::new();
+                (&original).read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"anchored-before-redirect");
+                delete_handle(&original).unwrap();
+                drop(original);
+            }
+            Err(error) => {
+                let code = error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error());
+                assert!(
+                    matches!(code, Some(1921 | 4395)),
+                    "expected explicit reparse refusal, not missing-file or unrelated failure: {error:#}"
+                );
+                assert!(!committed, "failure must not occur after a committed rename");
+                // Any successfully created stage was dropped by the failed attempt;
+                // verify original-directory cleanup after removing junction metadata.
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "operation created or renamed data into the redirect target"
         );
-        delete_handle(&original).unwrap();
-        drop(original);
         // Remove junction via the same metadata handle; after clearing it,
         // verify the original directory is empty and the target untouched.
         let mut delete_buffer = Vec::new();
