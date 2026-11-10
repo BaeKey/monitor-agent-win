@@ -228,12 +228,13 @@ fn run_foreground(args: Args) -> Result<()> {
 }
 
 fn run_service(arguments: Vec<OsString>) -> Result<()> {
-    let mut raw: Vec<String> = arguments.into_iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
-    // SCM may include the registered service name as argv[0] for ServiceMain.
-    if raw.first().is_some_and(|arg| arg != "service" && !arg.starts_with('-')) {
-        raw.remove(0);
-    }
+    // ServiceMain receives SCM start parameters, not the executable's ImagePath
+    // arguments. The registered --config/--service-name belong to process argv.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
     let service_name = parse_service_name(raw.iter().cloned())?;
+    if arguments.first().is_some_and(|name| !secure_fs::os_eq(name, std::ffi::OsStr::new(&service_name))) {
+        bail!("SCM service identity disagrees with the registered command line");
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let event_handler = move |event| match event {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,

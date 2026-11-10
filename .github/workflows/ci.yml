@@ -111,6 +111,7 @@ jobs:
             }
           }
       - name: Run all elevated filesystem and SCM recovery regressions
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: pwsh
         run: |

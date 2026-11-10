@@ -244,7 +244,7 @@ fn rename_handle(file: &File, parent: &File, name: &std::ffi::OsStr, replace: bo
     bytes[0] = u8::from(replace);
     bytes[root_offset..length_offset].copy_from_slice(&(parent.as_raw_handle() as usize).to_ne_bytes());
     bytes[length_offset..name_offset].copy_from_slice(&u32::try_from(units.len() * 2)?.to_ne_bytes());
-    for (part, unit) in bytes[name_offset..].chunks_exact_mut(2).zip(units) {
+    for (part, unit) in bytes[name_offset..].as_chunks_mut::<2>().0.iter_mut().zip(units) {
         part.copy_from_slice(&unit.to_ne_bytes());
     }
     let mut status = IoStatus { status: 0, information: 0 };
