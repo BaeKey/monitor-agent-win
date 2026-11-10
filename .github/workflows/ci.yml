@@ -66,6 +66,50 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
       - name: Run all tests (not just compile them)
         run: cargo +stable test --locked --target x86_64-pc-windows-msvc --all-targets
+      - name: Build executable for actual service installation smoke test
+        run: cargo +stable build --locked --target x86_64-pc-windows-msvc
+      - name: Install, coexist, upgrade and remove actual Windows services
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $exe = Join-Path $PWD 'target/x86_64-pc-windows-msvc/debug/monitor-agent.exe'
+          $names = @('monitor-agent-ci-a', 'monitor-agent-ci-b')
+          function Invoke-Agent([string[]] $Arguments) {
+            $output = @(& $exe @Arguments 2>&1)
+            $code = $LASTEXITCODE
+            $output | Write-Output
+            if ($code -ne 0) {
+              throw "agent exit ${code}: $($output -join ' ')"
+            }
+          }
+          try {
+            foreach ($name in $names) {
+              Invoke-Agent @('install', '--service-name', $name, '--server', 'https://127.0.0.1:9', '--token', 'ci-synthetic-token')
+              $service = Get-Service -Name $name
+              if ($service.Status -ne 'Running') { throw "$name did not become Running" }
+            }
+            # Same name is an upgrade, not a second service. Both instances use
+            # the shared exe and must recover after its atomic replacement.
+            Invoke-Agent @('install', '--service-name', $names[0], '--interval', '2')
+            foreach ($name in $names) {
+              if ((Get-Service -Name $name).Status -ne 'Running') { throw "$name not restored after upgrade" }
+            }
+            Invoke-Agent @('stop', '--service-name', $names[0])
+            Invoke-Agent @('start', '--service-name', $names[0])
+          } catch {
+            $detail = $_.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Actual Windows service lifecycle failed::$detail"
+            throw
+          } finally {
+            foreach ($name in $names) {
+              if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+                & $exe uninstall --service-name $name
+                if ($LASTEXITCODE -ne 0) { Write-Output "::error::Failed to remove CI service $name" }
+              }
+            }
+          }
       - name: Run all elevated filesystem and SCM recovery regressions
         timeout-minutes: 10
         shell: pwsh

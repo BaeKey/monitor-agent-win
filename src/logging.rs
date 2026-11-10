@@ -258,15 +258,13 @@ impl ProtectedFiles {
 impl LogStorage for ProtectedFiles {
     fn len(&mut self, slot: usize) -> io::Result<Option<u64>> {
         let path = self.checked_path(slot)?;
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                // The secure-fs check above rejects hardlinks/reparse points;
-                // protect existing backups too, not only the current file.
+        match crate::secure_fs::metadata_len(path) {
+            Ok(Some(size)) => {
                 crate::secure_fs::harden(path).map_err(io::Error::other)?;
-                Ok(Some(metadata.len()))
+                Ok(Some(size))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+            Ok(None) => Ok(None),
+            Err(error) => Err(io::Error::other(error)),
         }
     }
 
@@ -275,11 +273,7 @@ impl LogStorage for ProtectedFiles {
             self.active.take();
         }
         let path = self.checked_path(slot)?;
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        crate::secure_fs::remove_private_file(path).map_err(io::Error::other)
     }
 
     fn rename_if_exists(&mut self, from: usize, to: usize) -> io::Result<()> {

@@ -339,20 +339,74 @@ fn verify_service(service: &windows_service::service::Service, name: &str) -> Re
 }
 
 pub(super) fn configured_service_names() -> Result<Vec<String>> {
-    // SCM enumeration also finds instances using administrator-selected custom configs.
+    // Query readable unrelated services too: renamed display names must not hide
+    // instances holding the shared executable. Unreadable non-product services
+    // are not authority to modify our protected executable and can be skipped.
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let installed = installed_binary_path();
     let mut names = Vec::new();
-    for name in enumerate_service_names()? {
-        let service = manager.open_service(&name, ServiceAccess::QUERY_CONFIG)?;
-        let config = service.query_config()?;
-        let args = secure_fs::command_arguments(&config.executable_path)?;
-        if args.first().is_some_and(|v| secure_fs::os_eq(v, installed_binary_path().as_os_str())) {
-            validate_service_name(&name)?;
-            verify_service(&service, &name)?;
-            names.push(name);
+    for entry in enumerate_service_names()? {
+        let queried = manager
+            .open_service(&entry.name, ServiceAccess::QUERY_CONFIG)
+            .and_then(|service| service.query_config().map(|config| (service, config.executable_path)));
+        let Some((service, command)) = optional_service_query(&entry.display, queried)? else {
+            continue;
+        };
+        if !service_candidate(&entry.display, &command, &installed) {
+            continue;
         }
+        let name = entry.name.into_string().map_err(|_| anyhow!("non-UTF8 monitor-agent service name"))?;
+        validate_service_name(&name)?;
+        verify_service(&service, &name)?;
+        names.push(name);
     }
     Ok(names)
+}
+fn optional_service_query<T>(display: &OsStr, query: windows_service::Result<T>) -> Result<Option<T>> {
+    match query {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if product_display_name(display) => {
+            Err(error).context("cannot query monitor-agent candidate service")
+        }
+        Err(_) => Ok(None),
+    }
+}
+fn product_display_name(display: &OsStr) -> bool {
+    display.to_str().is_some_and(|s| s == SERVICE_DISPLAY_NAME || s.starts_with("Monitor Agent ("))
+}
+/// Only extract argv[0] for unrelated services; never subject their arbitrary
+/// remaining arguments to agent-specific argv count/size validation.
+fn service_candidate(display: &OsStr, command: &Path, installed: &Path) -> bool {
+    if product_display_name(display) {
+        return true;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let mut first = Vec::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in command.as_os_str().encode_wide() {
+        if c == 0 {
+            return false;
+        }
+        if c == b'"' as u16 {
+            quoted = !quoted;
+            started = true;
+            continue;
+        }
+        if matches!(c, 9 | 32) && !quoted {
+            if started {
+                break;
+            } else {
+                continue;
+            }
+        }
+        started = true;
+        first.push(c);
+        if first.len() > 32768 {
+            return false;
+        }
+    }
+    secure_fs::os_eq(&OsString::from_wide(&first), installed.as_os_str())
 }
 
 #[allow(dead_code)] // Retained helper API; durable install records full running set before stopping.
@@ -594,7 +648,11 @@ pub(super) fn status_service(service_name: &str) -> Result<()> {
 }
 
 /// Bounded SCM enumeration, independent of configuration directory contents.
-fn enumerate_service_names() -> Result<Vec<String>> {
+struct EnumeratedService {
+    name: OsString,
+    display: OsString,
+}
+fn enumerate_service_names() -> Result<Vec<EnumeratedService>> {
     use std::{ffi::c_void, os::windows::ffi::OsStringExt, ptr};
     type Handle = *mut c_void;
     #[repr(C)]
@@ -664,17 +722,17 @@ fn enumerate_service_names() -> Result<Vec<String>> {
         }
         for i in 0..count as usize {
             let entry = unsafe { &*buffer.as_ptr().cast::<Entry>().add(i) };
-            let p = entry.name as usize;
-            if p < base || p >= end || !p.is_multiple_of(2) {
-                bail!("SCM returned invalid service name pointer");
-            }
-            let max = ((end - p) / 2).min(257);
-            let len = unsafe { (0..max).find(|&n| *entry.name.add(n) == 0) }
-                .context("SCM service name exceeds limit")?;
-            let name = OsString::from_wide(unsafe { std::slice::from_raw_parts(entry.name, len) })
-                .into_string()
-                .map_err(|_| anyhow!("non-UTF8 SCM service name"))?;
-            names.push(name);
+            let extract = |string: *const u16| -> Result<OsString> {
+                let p = string as usize;
+                if p < base || p >= end || !p.is_multiple_of(2) {
+                    bail!("SCM returned invalid string pointer");
+                }
+                let max = ((end - p) / 2).min(257);
+                let len =
+                    unsafe { (0..max).find(|&n| *string.add(n) == 0) }.context("SCM string exceeds limit")?;
+                Ok(OsString::from_wide(unsafe { std::slice::from_raw_parts(string, len) }))
+            };
+            names.push(EnumeratedService { name: extract(entry.name)?, display: extract(entry.display)? });
             if names.len() > 4096 {
                 bail!("too many installed services to safely enumerate");
             }
@@ -1303,6 +1361,40 @@ mod recovery_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_query_denial_is_skipped_but_product_candidates_fail_closed() {
+        let denied = || windows_service::Error::Winapi(std::io::Error::from_raw_os_error(5));
+        assert!(optional_service_query::<()>(
+            OsStr::new("Windows unrelated protected service"),
+            Err(denied())
+        )
+        .unwrap()
+        .is_none());
+        for display in ["Monitor Agent", "Monitor Agent (edge-01)"] {
+            assert!(optional_service_query::<()>(OsStr::new(display), Err(denied())).is_err());
+        }
+        assert_eq!(optional_service_query(OsStr::new("unrelated"), Ok(7)).unwrap(), Some(7));
+    }
+    #[test]
+    fn unrelated_argv_is_not_subject_to_agent_limits_and_shared_exe_is_not_missed() {
+        let installed = Path::new(r"C:\ProgramData\monitor-agent\monitor-agent.exe");
+        let unrelated = format!(r#""C:\Windows\System32\unrelated.exe" {}"#, " long-argument".repeat(4097));
+        assert!(!service_candidate(OsStr::new("unrelated"), Path::new(&unrelated), installed));
+        let shared =
+            format!("\"{}\" service --config C:\\private.env --service-name edge", installed.display());
+        assert!(service_candidate(OsStr::new("renamed agent display"), Path::new(&shared), installed));
+        assert!(service_candidate(
+            OsStr::new("Monitor Agent (edge)"),
+            Path::new("bad-or-unreadable-command"),
+            installed
+        ));
+        assert!(!service_candidate(
+            OsStr::new("Monitor Agent Other Product"),
+            Path::new(r"C:\unrelated.exe"),
+            installed
+        ));
+    }
+
     #[test]
     fn reject_reserved_names_and_collisions() {
         for s in [

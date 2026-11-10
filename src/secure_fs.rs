@@ -20,6 +20,7 @@ struct Guid {
     c: u16,
     d: [u8; 8],
 }
+#[cfg(test)]
 #[repr(C)]
 struct SecurityAttributes {
     length: u32,
@@ -101,6 +102,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(p: Handle) -> Handle;
+    #[cfg(test)]
     fn CreateFileW(
         path: *const u16,
         access: u32,
@@ -110,13 +112,145 @@ unsafe extern "system" {
         flags: u32,
         template: Handle,
     ) -> Handle;
-    fn CreateDirectoryW(path: *const u16, sa: *const SecurityAttributes) -> i32;
     fn GetFileInformationByHandle(h: Handle, info: *mut FileInfo) -> i32;
-    fn MoveFileExW(old: *const u16, new: *const u16, flags: u32) -> i32;
 }
 #[link(name = "bcrypt")]
 unsafe extern "system" {
     fn BCryptGenRandom(algorithm: Handle, buffer: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum: u16,
+    buffer: *mut u16,
+}
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root: Handle,
+    name: *mut UnicodeString,
+    attributes: u32,
+    security: Handle,
+    qos: Handle,
+}
+#[repr(C)]
+struct IoStatus {
+    status: usize,
+    information: usize,
+}
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtCreateFile(
+        handle: *mut Handle,
+        access: u32,
+        attributes: *mut ObjectAttributes,
+        status: *mut IoStatus,
+        allocation: *const i64,
+        file_attributes: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        ea: Handle,
+        ea_length: u32,
+    ) -> i32;
+    fn NtSetInformationFile(
+        handle: Handle,
+        status: *mut IoStatus,
+        information: Handle,
+        length: u32,
+        class: u32,
+    ) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+fn nt_result(status: i32) -> Result<()> {
+    if status < 0 {
+        return Err(std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32).into());
+    }
+    Ok(())
+}
+/// A single component relative to an already-open directory, or the bootstrap
+/// drive root only. Never allow a caller to inject another path traversal.
+fn native_open(
+    root: Handle,
+    name: &std::ffi::OsStr,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    directory: bool,
+) -> Result<File> {
+    let mut units: Vec<_> = name.encode_wide().collect();
+    if units.is_empty()
+        || units.contains(&0)
+        || (!root.is_null()
+            && (units.iter().any(|c| matches!(*c, 47 | 92 | 58)) || name == "." || name == ".."))
+    {
+        bail!("invalid relative Windows component");
+    }
+    let length = u16::try_from(units.len() * 2).context("NT name too long")?;
+    let mut unicode = UnicodeString { length, maximum: length, buffer: units.as_mut_ptr() };
+    let sd = descriptor(directory)?;
+    let mut object = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root,
+        name: &mut unicode,
+        attributes: 0x40 | if root.is_null() { 0 } else { 0x1000 },
+        security: sd.0,
+        qos: ptr::null_mut(),
+    };
+    let mut status = IoStatus { status: 0, information: 0 };
+    let mut raw = ptr::null_mut();
+    let result = unsafe {
+        NtCreateFile(
+            &mut raw,
+            access | 0x100000,
+            &mut object,
+            &mut status,
+            ptr::null(),
+            0,
+            share,
+            disposition,
+            0x00200000 | 0x20 | if directory { 1 } else { 0x40 },
+            ptr::null_mut(),
+            0,
+        )
+    };
+    nt_result(result)?;
+    let file = unsafe { File::from_raw_handle(raw) };
+    check_type(&file, directory)?;
+    check_owner(&file, directory)?;
+    Ok(file)
+}
+fn delete_handle(file: &File) -> Result<()> {
+    let mut status = IoStatus { status: 0, information: 0 };
+    let mut delete = 1u8;
+    nt_result(unsafe {
+        NtSetInformationFile(file.as_raw_handle(), &mut status, ptr::addr_of_mut!(delete).cast(), 1, 13)
+    })
+}
+fn rename_handle(file: &File, parent: &File, name: &std::ffi::OsStr, replace: bool) -> Result<()> {
+    // FILE_RENAME_INFORMATION: BOOLEAN, HANDLE-aligned RootDirectory, ULONG,
+    // WCHAR FileName[]. Allocate pointer-aligned storage for the variable tail.
+    let units: Vec<_> = name.encode_wide().collect();
+    if units.is_empty() || units.iter().any(|c| matches!(*c, 0 | 47 | 92 | 58)) {
+        bail!("invalid rename component");
+    }
+    let root_offset = std::mem::size_of::<usize>();
+    let length_offset = root_offset * 2;
+    let name_offset = length_offset + 4;
+    let size = (name_offset + units.len() * 2).max(std::mem::size_of::<usize>() * 3);
+    let mut data = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), size) };
+    bytes[0] = u8::from(replace);
+    bytes[root_offset..length_offset].copy_from_slice(&(parent.as_raw_handle() as usize).to_ne_bytes());
+    bytes[length_offset..name_offset].copy_from_slice(&u32::try_from(units.len() * 2)?.to_ne_bytes());
+    for (part, unit) in bytes[name_offset..].chunks_exact_mut(2).zip(units) {
+        part.copy_from_slice(&unit.to_ne_bytes());
+    }
+    let mut status = IoStatus { status: 0, information: 0 };
+    nt_result(unsafe {
+        NtSetInformationFile(file.as_raw_handle(), &mut status, data.as_mut_ptr().cast(), size as u32, 10)
+    })
 }
 
 struct Local(Handle);
@@ -194,54 +328,31 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
     wide(p.as_os_str())?;
     Ok(p)
 }
-fn open(path: &Path, write: bool, create: bool, directory: bool, share_delete: bool) -> Result<File> {
-    let path = wide(path.as_os_str())?;
-    let sd = descriptor(directory)?;
-    let sa = SecurityAttributes {
-        length: std::mem::size_of::<SecurityAttributes>() as u32,
-        descriptor: sd.0,
-        inherit: 0,
-    };
-    // READ_CONTROL | WRITE_DAC. Creation has its final protected DACL BEFORE data is written.
-    let access = 0x20000 | 0x80 // READ_CONTROL | FILE_READ_ATTRIBUTES for handle type checks
-        | if directory {
-            // FILE_LIST_DIRECTORY participates in data-access sharing checks.
-            // A metadata-only handle does NOT enforce our no-write/no-delete
-            // sharing policy against preexisting or subsequent data writers.
-            // Every ancestor and private leaf pin must request this access.
-            0x1 | if write { 0x40000 } else { 0 }
-        } else if write {
-            0x40000 | 0x40000000
-        } else {
-            0x80000000
-        };
-    let h = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            access,
-            1 | if share_delete { 4 } else { 0 },
-            &sa,
-            if create { 1 } else { 3 },
-            0x00200000 | if directory { 0x02000000 } else { 0 },
-            ptr::null_mut(),
-        )
-    };
-    if h as isize == -1 {
-        return Err(std::io::Error::last_os_error().into());
+fn open(path: &Path, write: bool, create: bool, is_dir: bool, share_delete: bool) -> Result<File> {
+    if is_dir {
+        let path = absolute(path)?;
+        let parent = walk_directory(path.parent().context("missing directory parent")?, false, false)?;
+        return native_open(
+            parent.final_file().as_raw_handle(),
+            path.file_name().context("missing directory name")?,
+            0x20080 | if write { 0x40000 } else { 0 },
+            3,
+            1,
+            true,
+        );
     }
-    // Own the successful handle immediately, including all validation error paths.
-    let f = unsafe { File::from_raw_handle(h) };
-    let validation = check_type(&f, directory).and_then(|()| check_owner(&f, directory));
-    if let Err(e) = validation {
-        drop(f);
-        // CREATE_NEW succeeded, so this is our own empty protected stage only.
-        if create {
-            let _ = std::fs::remove_file(Path::new(&OsString::from_wide(&path[..path.len() - 1])));
-        }
-        return Err(e);
-    }
-    Ok(f)
+    let path = absolute(path)?;
+    let parent = directory(path.parent().context("missing parent")?, false)?;
+    native_open(
+        parent.final_file().as_raw_handle(),
+        path.file_name().context("missing filename")?,
+        0x20080 | if write { 0x40000 | 0x40000000 } else { 0x80000000 },
+        1 | if share_delete { 4 } else { 0 },
+        if create { 2 } else { 1 },
+        false,
+    )
 }
+
 fn check_type(f: &File, directory: bool) -> Result<()> {
     let mut info: FileInfo = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
@@ -327,8 +438,8 @@ fn check_file_mutation_acl(f: &File) -> Result<()> {
 fn check_directory_acl(f: &File, ancestor: bool) -> Result<()> {
     // Normal Windows ancestors grant Users child creation and WRITE_ATTRIBUTES.
     // These are not authority to delete an existing child or take over its ACL.
-    // Reparse mutation requires a data-write handle: directory() pins every
-    // component with share READ only, rejecting existing AND future such handles.
+    // Metadata handles can set reparse data. Safety comes from handle-relative
+    // child opens with OBJ_DONT_REPARSE, not an assumed sharing-mode prohibition.
     // Private leaf directories retain the complete mutation mask below.
     let mask =
         if ancestor { 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x40 } else { FILE_MUTATION_MASK | 0x40 };
@@ -421,56 +532,56 @@ pub fn protect(f: &File, directory: bool) -> Result<()> {
     }
     Ok(())
 }
-/// Retain no-delete-share handles for EVERY ancestor until the caller finishes.
+/// Anchored directory identity, NOT a claim that metadata cannot set reparse data.
+/// Every child operation uses RootDirectory; a later junction never redirects it.
 pub struct DirectoryGuard {
-    _handles: Vec<File>,
+    handles: Vec<File>,
+    path: PathBuf,
+}
+impl DirectoryGuard {
+    fn final_file(&self) -> &File {
+        self.handles.last().expect("validated drive root")
+    }
 }
 pub fn directory(path: &Path, create: bool) -> Result<DirectoryGuard> {
-    let path = absolute(path)?;
-    let mut handles = Vec::new();
-    let mut prefix = PathBuf::new();
-    let components: Vec<_> = path.components().collect();
-    for (i, c) in components.iter().enumerate() {
-        prefix.push(c.as_os_str());
-        if i == 0 {
-            continue;
-        }
-        let last = i + 1 == components.len();
-        match open(&prefix, last && create, false, true, false) {
-            Ok(f) => {
-                if last {
-                    check_owner(&f, false)?;
-                }
-                check_directory_acl(&f, !last)
-                    .with_context(|| format!("unsafe directory ACL {}", prefix.display()))?;
-                if last && create {
-                    protect(&f, true)?;
-                }
-                handles.push(f);
-            }
-            Err(e) => {
-                if !last || !create || !is_missing(&e) {
-                    return Err(e).with_context(|| format!("unsafe directory {}", prefix.display()));
-                }
-                let sd = descriptor(true)?;
-                let sa = SecurityAttributes {
-                    length: std::mem::size_of::<SecurityAttributes>() as u32,
-                    descriptor: sd.0,
-                    inherit: 0,
-                };
-                if unsafe { CreateDirectoryW(wide(prefix.as_os_str())?.as_ptr(), &sa) } == 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                let f = open(&prefix, true, false, true, false)?;
-                check_directory_acl(&f, false)
-                    .with_context(|| format!("unsafe new directory ACL {}", prefix.display()))?;
-                protect(&f, true)?;
-                handles.push(f);
-            }
-        }
-    }
-    Ok(DirectoryGuard { _handles: handles })
+    walk_directory(path, create, true)
 }
+fn walk_directory(path: &Path, create: bool, private_leaf: bool) -> Result<DirectoryGuard> {
+    let path = absolute(path)?;
+    let components: Vec<_> = path.components().collect();
+    let drive = components[0].as_os_str().to_string_lossy();
+    let native_root = OsString::from(format!(r"\??\{drive}\"));
+    // Bootstrap only the local drive root. All remaining names are single
+    // components relative to a validated directory handle, never full paths.
+    let root = native_open(ptr::null_mut(), &native_root, 0x200a0, 3, 1, true)?;
+    check_directory_acl(&root, true).context("unsafe local drive root ACL")?;
+    let mut handles = vec![root];
+    let mut prefix = PathBuf::from(format!(r"{drive}\"));
+    for (index, component) in components.iter().enumerate().skip(2) {
+        prefix.push(component.as_os_str());
+        let last = index + 1 == components.len();
+        let file = native_open(
+            handles.last().unwrap().as_raw_handle(),
+            component.as_os_str(),
+            0x200a0 | if last && create { 0x40000 } else { 0 },
+            3,
+            if last && create { 3 } else { 1 },
+            true,
+        )
+        .with_context(|| format!("open anchored directory {}", prefix.display()))?;
+        if last && private_leaf {
+            check_owner(&file, false)?;
+        }
+        check_directory_acl(&file, !last || !private_leaf)
+            .with_context(|| format!("unsafe directory ACL {}", prefix.display()))?;
+        if last && create {
+            protect(&file, true)?;
+        }
+        handles.push(file);
+    }
+    Ok(DirectoryGuard { handles, path })
+}
+
 pub fn is_missing(e: &anyhow::Error) -> bool {
     e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.raw_os_error(), Some(2 | 3)))
 }
@@ -503,30 +614,31 @@ fn read_checked(path: &Path, limit: u64, secret: bool) -> Result<zeroize::Zeroiz
     }
     Ok(bytes)
 }
-fn inspect(path: &Path, write_dac: bool) -> Result<File> {
-    let p = wide(path.as_os_str())?;
-    // Metadata-only handle interoperates with the live append writer. It does not
-    // grant a second writer; broad sharing here only accepts preexisting access.
-    let h = unsafe {
-        CreateFileW(
-            p.as_ptr(),
-            0x20000 | 0x80 | if write_dac { 0x40000 } else { 0 },
-            1 | 2 | 4,
-            ptr::null(),
-            3,
-            0x00200000,
-            ptr::null_mut(),
-        )
-    };
-    if h as isize == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let f = unsafe { File::from_raw_handle(h) };
-    check_type(&f, false)?;
-    check_owner(&f, false)?;
-    check_file_mutation_acl(&f)?;
-    Ok(f)
+fn inspect_at(parent: &File, name: &std::ffi::OsStr, write_dac: bool) -> Result<File> {
+    let file = native_open(
+        parent.as_raw_handle(),
+        name,
+        0x20080 | if write_dac { 0x40000 } else { 0 },
+        7,
+        1,
+        false,
+    )?;
+    check_file_mutation_acl(&file)?;
+    Ok(file)
 }
+fn inspect(path: &Path, write_dac: bool) -> Result<File> {
+    let path = absolute(path)?;
+    let parent = directory(path.parent().context("missing parent")?, false)?;
+    inspect_at(parent.final_file(), path.file_name().context("missing filename")?, write_dac)
+}
+pub fn metadata_len(path: &Path) -> Result<Option<u64>> {
+    match inspect(path, false) {
+        Ok(file) => Ok(Some(file.metadata()?.len())),
+        Err(e) if is_missing(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Exact protected DACL, never an additive grant. Caller pins parent for rotations.
 pub fn harden(path: &Path) -> Result<()> {
     let _guard = directory(path.parent().context("missing parent")?, false)?;
@@ -544,91 +656,98 @@ pub fn check_destination(path: &Path) -> Result<()> {
 pub struct Stage {
     pub path: PathBuf,
     file: Option<File>,
+    parent: DirectoryGuard,
     cleanup: bool,
 }
 impl Stage {
     pub fn new(parent: &Path) -> Result<Self> {
+        Self::in_directory(directory(parent, false)?)
+    }
+    fn in_directory(parent: DirectoryGuard) -> Result<Self> {
         let mut random = [0u8; 16];
         if unsafe { BCryptGenRandom(ptr::null_mut(), random.as_mut_ptr(), 16, 2) } < 0 {
             bail!("secure random generation failed");
         }
-        let name = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let path = parent.join(format!(".stage-{name}"));
-        let file = open(&path, true, true, false, false)?;
-        let stage = Self { path, file: Some(file), cleanup: true };
+        let name = OsString::from(format!(
+            ".stage-{}",
+            random.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        let path = parent.path.join(&name);
+        let file = native_open(
+            parent.final_file().as_raw_handle(),
+            &name,
+            0x40000000 | 0x10000 | 0x60080,
+            1 | 4,
+            2,
+            false,
+        )?;
+        let stage = Self { path, file: Some(file), parent, cleanup: true };
         protect(stage.file(), false)?;
         Ok(stage)
     }
     pub fn file(&self) -> &File {
-        self.file.as_ref().expect("stage file open before commit")
+        self.file.as_ref().expect("stage open until commit")
     }
     pub fn write_all(&self, bytes: &[u8]) -> Result<()> {
-        let mut file = self.file();
-        file.write_all(bytes)?;
+        let mut f = self.file();
+        f.write_all(bytes)?;
         Ok(())
     }
     pub fn copy_from(&self, source: &mut impl Read) -> Result<u64> {
-        let mut file = self.file();
-        Ok(std::io::copy(source, &mut file)?)
+        let mut f = self.file();
+        Ok(std::io::copy(source, &mut f)?)
     }
-    /// Close and retain a protected backup referenced by a durable recovery record.
     pub fn persist(mut self) -> Result<PathBuf> {
         self.file().sync_all()?;
-        drop(self.file.take());
         self.cleanup = false;
         Ok(self.path.clone())
     }
     pub fn commit(mut self, target: &Path) -> Result<()> {
-        self.file().sync_all()?;
-        check_destination(target)?;
-        drop(self.file.take());
-        // Parent DirectoryGuard pins the protected directory throughout this operation.
-        if unsafe {
-            MoveFileExW(wide(self.path.as_os_str())?.as_ptr(), wide(target.as_os_str())?.as_ptr(), 1 | 8)
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
+        let target = absolute(target)?;
+        if !target.parent().is_some_and(|p| os_eq(p.as_os_str(), self.parent.path.as_os_str())) {
+            bail!("stage commit must remain in its original directory");
         }
+        let name = target.file_name().context("missing commit filename")?;
+        match inspect_at(self.parent.final_file(), name, false) {
+            Ok(_) => {}
+            Err(e) if is_missing(&e) => {}
+            Err(e) => return Err(e),
+        }
+        self.file().sync_all()?;
+        rename_handle(self.file(), self.parent.final_file(), name, true)?;
+        self.cleanup = false;
         Ok(())
     }
 }
 impl Drop for Stage {
     fn drop(&mut self) {
-        drop(self.file.take());
         if self.cleanup {
-            let _ = std::fs::remove_file(&self.path);
+            if let Some(file) = &self.file {
+                let _ = delete_handle(file);
+            }
         }
     }
 }
+
 pub fn ensure_private_dir(path: &Path) -> Result<DirectoryGuard> {
     directory(path, true)
 }
 /// Caller keeps an ensure_private_dir guard alive across writes and rotations.
 /// No delete-sharing: a live writer cannot silently move to an attacker-chosen file.
 pub fn open_log(path: &Path) -> Result<File> {
-    let _guard = ensure_private_dir(path.parent().context("missing log parent")?)?;
-    let file = match open(path, true, true, false, false) {
-        Ok(f) => f,
-        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|v| v.raw_os_error() == Some(80)) => {
-            open(path, true, false, false, false)?
-        }
-        Err(e) => return Err(e),
-    };
-    protect(&file, false)?;
-    // Use FILE_APPEND_DATA, not a seek followed by a write (which races other writers).
-    drop(file);
-    let p = wide(path.as_os_str())?;
-    let h = unsafe {
-        CreateFileW(p.as_ptr(), 0x4 | 0x20000 | 0x80, 1, ptr::null(), 3, 0x00200000, ptr::null_mut())
-    };
-    if h as isize == -1 {
-        return Err(std::io::Error::last_os_error().into());
+    let path = absolute(path)?;
+    let parent = ensure_private_dir(path.parent().context("missing log parent")?)?;
+    let name = path.file_name().context("missing log filename")?;
+    {
+        let file = native_open(parent.final_file().as_raw_handle(), name, 0x60080, 7, 3, false)?;
+        check_file_mutation_acl(&file)?;
+        protect(&file, false)?;
     }
-    let f = unsafe { File::from_raw_handle(h) };
-    check_type(&f, false)?;
-    check_owner(&f, false)?;
-    Ok(f)
+    let file = native_open(parent.final_file().as_raw_handle(), name, 0x20084, 1, 1, false)?;
+    check_file_mutation_acl(&file)?;
+    Ok(file)
 }
+
 /// Snapshot a preexisting protected regular file for rollback, without reading it all into RAM.
 pub fn backup(path: &Path) -> Result<Option<Stage>> {
     let source = match open(path, false, false, false, false) {
@@ -647,7 +766,10 @@ pub fn lock(parent: &Path) -> Result<File> {
     let path = parent.join(".install.lock");
     let f = match open(&path, true, true, false, false) {
         Ok(f) => f,
-        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|v| v.raw_os_error() == Some(80)) => {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|v| matches!(v.raw_os_error(), Some(80 | 183))) =>
+        {
             open(&path, true, false, false, false)?
         }
         Err(e) => return Err(e),
@@ -721,21 +843,29 @@ pub fn cleanup_stages(parent: &Path) -> Result<()> {
         let age = f.metadata()?.modified()?.elapsed().unwrap_or_default();
         drop(f);
         if age >= std::time::Duration::from_secs(24 * 3600) {
-            std::fs::remove_file(path)?;
+            remove_private_file(&path)?;
         }
     }
     Ok(())
 }
 /// Remove only a checked regular single-link file, with its directory pinned.
 pub fn remove_private_file(path: &Path) -> Result<()> {
-    let _guard = directory(path.parent().context("missing parent")?, false)?;
-    match inspect(path, false) {
-        Ok(f) => drop(f),
+    let path = absolute(path)?;
+    let parent = directory(path.parent().context("missing parent")?, false)?;
+    let file = match native_open(
+        parent.final_file().as_raw_handle(),
+        path.file_name().context("missing filename")?,
+        0x30080,
+        1 | 4,
+        1,
+        false,
+    ) {
+        Ok(f) => f,
         Err(e) if is_missing(&e) => return Ok(()),
         Err(e) => return Err(e),
-    }
-    std::fs::remove_file(path)?;
-    Ok(())
+    };
+    check_file_mutation_acl(&file)?;
+    delete_handle(&file)
 }
 
 /// Same-directory, no-replace rename. Caller pins its protected parent directory
@@ -744,18 +874,26 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
     let from = absolute(from)?;
     let to = absolute(to)?;
     if !from.parent().zip(to.parent()).is_some_and(|(a, b)| os_eq(a.as_os_str(), b.as_os_str())) {
-        bail!("log rename must stay in the same protected directory");
+        bail!("rename requires same parent");
     }
-    let _guard = directory(from.parent().context("missing rename parent")?, false)?;
-    // Source must exist and be a trusted regular single-link file. Do not turn
-    // NotFound into success here: the log-storage adapter owns that policy.
-    drop(inspect(&from, false)?);
-    check_destination(&to)?;
-    if unsafe { MoveFileExW(wide(from.as_os_str())?.as_ptr(), wide(to.as_os_str())?.as_ptr(), 0) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let parent = directory(from.parent().context("missing parent")?, false)?;
+    let file = native_open(
+        parent.final_file().as_raw_handle(),
+        from.file_name().context("missing filename")?,
+        0x30080,
+        1 | 4,
+        1,
+        false,
+    )?;
+    check_file_mutation_acl(&file)?;
+    match inspect_at(parent.final_file(), to.file_name().context("missing target name")?, false) {
+        Ok(_) => {}
+        Err(e) if is_missing(&e) => {}
+        Err(e) => return Err(e),
     }
-    Ok(())
+    rename_handle(&file, parent.final_file(), to.file_name().context("missing target name")?, false)
 }
+
 /// Verify confidentiality before snapshotting recovery secrets, unlike legacy repair.
 pub fn backup_secret(path: &Path) -> Result<Option<Stage>> {
     let _guard = directory(path.parent().context("missing backup parent")?, false)?;
@@ -776,6 +914,16 @@ pub fn backup_secret(path: &Path) -> Result<Option<Stage>> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn native_struct_layouts_match_windows_x64_abi() {
+        assert_eq!(std::mem::size_of::<UnicodeString>(), 16);
+        assert_eq!(std::mem::size_of::<ObjectAttributes>(), 48);
+        assert_eq!(std::mem::size_of::<IoStatus>(), 16);
+        assert_eq!(std::mem::offset_of!(ObjectAttributes, root), 8);
+        assert_eq!(std::mem::offset_of!(ObjectAttributes, name), 16);
+        assert_eq!(std::mem::offset_of!(ObjectAttributes, security), 32);
+    }
 
     fn set_test_users_ace(path: &Path, mask: u32) {
         let text = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{mask:08x};;;BU)");
@@ -895,9 +1043,9 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    /// Exercise the actual NTFS FSCTL, not merely Rust symlink creation. A successful
-    /// unpinned control establishes that failures are access/share protection rather
-    /// than an invalid reparse buffer or an unavailable filesystem feature.
+    /// Metadata handles CAN set junctions. The security invariant is that held
+    /// RootDirectory handles still access their original namespace, while fresh
+    /// walks reject the redirected component. No share-mode prevention claim.
     #[test]
     #[ignore = "requires elevated Windows token and NTFS reparse-point support"]
     fn pinned_directory_blocks_reparse_mutation_and_preexisting_writer() {
@@ -972,30 +1120,74 @@ mod tests {
         for value in substitute.iter().copied().chain([0]).chain(print.iter().copied()).chain([0]) {
             buffer.extend_from_slice(&value.to_le_bytes());
         }
-        // An already-open generic writer must prevent acquiring a trusted pin.
-        let writer = write_handle(&ancestor, 0x40000000).unwrap();
-        assert!(directory(&ancestor, false).is_err(), "pin accepted preexisting data writer");
-        drop(writer);
         let pin = directory(&ancestor, false).unwrap();
-        let error = write_handle(&ancestor, 0x40000000).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(32), "pinned directory must deny later generic writer");
-        // WRITE_ATTRIBUTES is compatible with normal ancestor ACLs but cannot
-        // authorize FSCTL_SET_REPARSE_POINT (requires data-write access).
+        let stage_parent = directory(&ancestor, false).unwrap();
         let attributes = write_handle(&ancestor, 0x100 | 0x80).unwrap();
-        let error = set_reparse(&attributes, &buffer).unwrap_err();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(5),
-            "metadata-only handle unexpectedly authorized reparse mutation"
+        set_reparse(&attributes, &buffer)
+            .expect("positive control: metadata handle CAN create junction while guards live");
+        assert!(directory(&ancestor, false).is_err(), "new walk must reject redirected ancestor");
+        assert!(read_secret(&ancestor.join("guarded.env"), 1024).is_err());
+        // Create and commit through the parent handle captured before redirection.
+        // The junction is set on an empty directory, as required by NTFS.
+        let anchored_stage = Stage::in_directory(stage_parent).unwrap();
+        anchored_stage.write_all(b"anchored-before-redirect").unwrap();
+        // Existing parent handles must never follow newly attached reparse data.
+        anchored_stage.commit(&ancestor.join("guarded.env")).unwrap();
+        assert!(!target.join("guarded.env").exists(), "stage rename escaped to attacker directory");
+        let original = native_open(
+            pin.final_file().as_raw_handle(),
+            std::ffi::OsStr::new("guarded.env"),
+            0x80030080,
+            1 | 4,
+            1,
+            false,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        (&original).read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"anchored-before-redirect");
+        let new_stage = Stage::in_directory(directory(&root, false).unwrap()).unwrap();
+        new_stage.write_all(b"unrelated root stage").unwrap();
+        drop(new_stage);
+        let cleanup_stage = Stage::in_directory(DirectoryGuard {
+            handles: vec![pin.final_file().try_clone().unwrap()],
+            path: ancestor.clone(),
+        })
+        .unwrap();
+        let stage_name = cleanup_stage.path.file_name().unwrap().to_owned();
+        drop(cleanup_stage);
+        assert!(
+            native_open(pin.final_file().as_raw_handle(), &stage_name, 0x20080, 7, 1, false).is_err(),
+            "stage drop did not remove original-directory object"
+        );
+        delete_handle(&original).unwrap();
+        drop(original);
+        // Remove junction via the same metadata handle; after clearing it,
+        // verify the original directory is empty and the target untouched.
+        let mut delete_buffer = Vec::new();
+        delete_buffer.extend_from_slice(&0xa0000003u32.to_le_bytes());
+        delete_buffer.extend_from_slice(&[0; 4]);
+        let mut returned = 0;
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    attributes.as_raw_handle(),
+                    0x000900ac,
+                    delete_buffer.as_ptr().cast(),
+                    8,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            },
+            0
         );
         drop(attributes);
         drop(pin);
-        let writer = write_handle(&ancestor, 0x40000000).unwrap();
-        set_reparse(&writer, &buffer).expect("unpinned positive control must successfully set a junction");
-        drop(writer);
-        assert!(directory(&ancestor, false).is_err(), "junction was trusted as ordinary directory");
-        std::fs::remove_dir(&ancestor).unwrap(); // removes junction, never its target
-        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&ancestor).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir(&ancestor).unwrap();
         std::fs::remove_dir(&target).unwrap();
         drop(root_guard);
         std::fs::remove_dir(root).unwrap();

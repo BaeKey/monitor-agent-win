@@ -253,7 +253,7 @@ CI 做 fmt/check/clippy，没有运行 Windows tests。Linux 上交叉 Clippy �
 
 | 原发现 | 当前措施 |
 |---|---|
-| F01/F02 | Known Folder 安装路径；严格目录所有者、祖先权限、重解析点与硬链接检查；句柄保持；创建时精确受保护 DACL；随机独占 stage；配置在信任前拒绝非受信主体可修改的显式 ACE。 |
+| F01/F02 | Known Folder 安装路径；严格目录所有者、祖先权限、重解析点与硬链接检查；逐组件、目录句柄相对的打开/替换/删除，避免祖先在检查后被重定向；创建时精确受保护 DACL；随机独占 stage；配置在信任前拒绝非受信主体可修改的显式 ACE。 |
 | F03/F04 | 进程级滑动窗口限流、真实 socket 许可、目标冷却、延迟首次探测；有界控制消息；固定两个 DNS worker 和 16 项队列，超时不解除真实 in-flight。 |
 | F05 | 默认公网探测策略；本地 `--probe-allow` / `MONITOR_PROBE_ALLOW` CIDR/IP 可选 `@port` 追加授权；DNS 后校验和 mapped IPv6 处理。 |
 | F06 | 非阻塞有界日志队列、限长和控制字符转义、限流、1 MiB × 4 文件容量边界、安全文件打开与独占 writer。 |
@@ -268,5 +268,6 @@ CI 做 fmt/check/clippy，没有运行 Windows tests。Linux 上交叉 Clippy �
 - 系统 DNS、磁盘驱动及其他 OS 调用不能由 Rust 强制终止；固定 worker 数量确保不无限增长，worker 卡死可能使对应功能停止采样/解析。
 - 日志为尽力投递，过载或退出允许丢弃。秘密清零不能清除所有系统/TLS副本，也不能防御管理员内存读取。
 - 安装中断恢复在下一次管理员执行 `install` 时进行；不宣称断电后无需人工动作即自动完成多文件/SCM事务。恢复失败保留记录并明确报错，不启动配置可能不匹配的目标实例。
+- 原生 NTFS 回归发现，metadata-only 句柄和目录共享限制不能阻止 `WRITE_ATTRIBUTES` 句柄设置重解析点；不得将句柄持有误当成“路径冻结”。当前改用逐组件 RootDirectory 相对打开以及按句柄重命名/删除，并保留攻击正向对照测试。
 - 路径保护以 SYSTEM、Administrators 和必要的系统祖先 TrustedInstaller 为信任边界，不试图防御同等高权限恶意操作。
 - 本地不安装交叉编译器；实际编译和 Windows 回归由 GitHub 执行。首轮 `ff54635` 已通过 GNU 类型检查、Windows tests、管理员文件系统回归及 RustSec；Clippy strict 发现的问题正在后续检查中收敛。最终通过状态以分支最新提交对应的 GitHub 结果为准。
